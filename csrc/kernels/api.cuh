@@ -141,7 +141,7 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-              int* packed_recv_count,
+              int* packed_recv_count, int* per_rank_recv_count,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
@@ -151,11 +151,13 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               void* workspace, int num_device_sms,
-              cudaStream_t stream, int phases);
+              cudaStream_t stream, int phases,
+              int dispatch_round_n, const int eager_opt);
 
 void combine(void* combined_x,
              void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
              const void* x, const int64_t* topk_idx, const float* topk_weights,
+             const int* per_rank_src_count,
              const int* src_info, const int64_t* layout_range,
              int64_t* combine_wait_recv_cost_stats,
              int* next_clean, int num_next_clean_int,
@@ -163,7 +165,8 @@ void combine(void* combined_x,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt,
              void* workspace, int num_device_sms,
-             cudaStream_t stream, int phases, bool zero_copy);
+             cudaStream_t stream, int phases, bool zero_copy,
+             int combine_round_n, const int eager_opt);
 
 } // namespace internode_ll
 

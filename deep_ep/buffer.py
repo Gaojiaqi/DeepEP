@@ -29,12 +29,18 @@ class Buffer:
 
     num_sms: int = 20
 
+    # eager.cuh defs
+    EAGER_LOAD = 0
+    EAGER_OFF = 1
+    EAGER_CHK = 2
+    EAGER_FULL = 3
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
                  low_latency_mode: bool = False, num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
-                 explicitly_destroy: bool = False) -> None:
+                 explicitly_destroy: bool = False,
+                 eager_support: bool = False) -> None:
         """
         Initialize the communication buffer.
 
@@ -64,7 +70,8 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
-        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy)
+        self.eager_support = eager_support
+        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy, eager_support)
 
         # Synchronize device IDs
         device_ids = [None, ] * self.group_size
@@ -98,6 +105,9 @@ class Buffer:
             if not allow_mnnvl:
                 # Disable multi-node NVLink detection
                 os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+            
+            if eager_support:
+                os.environ['NVSHMEM_IB_ENABLE_RELAXED_ORDERING'] = '0' # // Disable relaxed ordering to support eager recv
 
             # Synchronize using the root ID
             nvshmem_unique_ids = [None, ] * self.group_size
@@ -149,7 +159,7 @@ class Buffer:
         return EventOverlap(EventHandle())
 
     @staticmethod
-    def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+    def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int, eager_support : bool) -> int:
         """
         Get a minimum size requirement for the RDMA buffer. The size calculation will be done with BF16.
 
@@ -162,7 +172,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, eager_support)
     
     def get_comm_stream(self) -> torch.Stream:
         """
@@ -517,7 +527,7 @@ class Buffer:
                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
-                             async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             async_finish: bool = False, eager_opt : int = EAGER_OFF, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -566,14 +576,17 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+        if not self.eager_support and eager_opt != self.EAGER_OFF:
+            print('WARN: eager_opt != EAGER_OFF is not supported when eager_support is not enabled, fallback to EAGER_OFF.')
+            eager_opt = self.EAGER_OFF
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, per_rank_recv_count, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
                                               dispatch_wait_recv_cost_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
-                                              async_finish, return_recv_hook)
-        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+                                              async_finish, return_recv_hook, eager_opt)
+        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, per_rank_recv_count, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
                              packed_recv_src_info, packed_recv_layout_range,
@@ -584,7 +597,7 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
-                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
+                            return_recv_hook: bool = False, eager_opt : int = EAGER_OFF, out: Optional[torch.Tensor] = None,
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
@@ -620,12 +633,15 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
+        if not self.eager_support and eager_opt != self.EAGER_OFF:
+            print('WARN: eager_opt != EAGER_OFF is not supported when eager_support is not enabled, fallback to EAGER_OFF.')
+            eager_opt = self.EAGER_OFF
+        src_info, layout_range, num_max_dispatch_tokens_per_rank, per_rank_recv_count, hidden, num_experts = handle
+        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, per_rank_recv_count, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats,
                                                                    num_max_dispatch_tokens_per_rank, num_experts,
                                                                    use_logfmt, zero_copy, async_finish, return_recv_hook,
-                                                                   out)
+                                                                   eager_opt, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 
@@ -641,5 +657,5 @@ class Buffer:
                 `[num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden]`, you should fill this buffer
                 by yourself.
         """
-        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        src_info, layout_range, num_max_dispatch_tokens_per_rank, _, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
