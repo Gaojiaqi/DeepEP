@@ -103,7 +103,7 @@ __device__ __inline__ bool eager_dispatch_recv_token(
     if (lane_id == 0) {
         shfl_value = atomic_add_release_global(packed_recv_count + local_expert_idx, 1);
         int zzz = atomicAdd(per_rank_recv_cnt_ptr + src_rank, 1);
-        //printf("[rank %d]: dispatch recv token expert %d slot %d get rank %d token %d, it is %d-th\n", rank, global_expert_idx, shfl_value, src_rank, LD_SHIFTED(ld_nc_global, src_src_idx, src_src_idx), zzz);
+        //printf("[rank %d]: round 0x%x dispatch recv token expert %d slot %d get rank %d token %d, it is %d-th\n", rank, dispatch_round_n, global_expert_idx, shfl_value, src_rank, LD_SHIFTED(ld_nc_global, src_src_idx, src_src_idx), zzz);
         token_src_bitmap[i] = shfl_value;
     }
     __syncwarp();
@@ -329,14 +329,14 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             // The first SM is also responsible for checking QPs
             EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
 
-            // The first SM is also responsible for cleaning the next buffer
-            #pragma unroll
-            for (int i = lane_id; i < num_next_clean_int; i += 32)
-                next_clean[i] = 0;
+            if constexpr (kEager != EAGER_FULL) {
+                // The first SM is also responsible for cleaning the next buffer
+                #pragma unroll
+                for (int i = lane_id; i < num_next_clean_int; i += 32)
+                    next_clean[i] = 0;
 
-            // Notify before executing `int_p`
-            __syncwarp();
-            if (kEager != EAGER_FULL) {
+                // Notify before executing `int_p`
+                __syncwarp();
                 #pragma unroll
                 for (int i = lane_id; i < num_experts; i += 32)
                     atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
@@ -361,29 +361,37 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
             if (lane_id == 0) {
-                if (kEager == EAGER_FULL) {
+                if constexpr (kEager == EAGER_FULL) {
                     const auto dst_rank = i / num_local_experts;
                     const auto dst_expert_local_idx = i % num_local_experts;
-                    const auto num_tokens_sent = -sum - 1;
+                    const auto num_tokens_sent = ((-sum - 1) & 0xffff) | SHORT_TAG(dispatch_round_n);
+                    //atomicAdd(atomic_finish_counter_per_expert, -1);
+                    // EP_DEVICE_ASSERT(num_next_clean_int == num_experts); 
+                    // next_clean[dst_expert_local_idx * num_ranks + dst_rank] = 0;
                     auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
                     auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
-                    //if (sum != 0) printf("[rank %d]: %d tokens to expert %d\n", rank, sum, i);
                     if (dst_p2p_ptr == 0) {
                         nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), num_tokens_sent, dst_rank, dst_expert_local_idx);
                     } else {
                         st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), num_tokens_sent);
                     }
+                    //printf("[rank %d]: round 0x%x %d tokens to expert %d at rank %d\n", rank, dispatch_round_n, sum, i, i / num_local_experts);
                 } else {
                     shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
                     atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
                 }
             }
         }
+        // if constexpr (kEager == EAGER_FULL) { // flush all p2p write out
+        //     if (lane_id == 0 && atomicAdd(atomic_finish_counter_per_expert + 1, 1) % num_sms == (num_sms - 1)) {
+        //         __threadfence_system();
+        //         //printf("[rank %d]: round 0x%x try to flush p2p write out\n", rank, dispatch_round_n);
+        //     }
+        // }
     }
-
     if (kEager != EAGER_FULL) {
+        
         __syncthreads();
-
         // Issue count sends
         if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
             const auto dst_rank = responsible_expert_idx / num_local_experts;
@@ -574,6 +582,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                             if (token_index >= num_max_dispatch_tokens_per_rank || (num_recv_tokens != 0 && token_index >= -num_recv_tokens-1)) { // out of range, so this virtual warp is done
                                 token_index = -1; // this virtual warp is done
                                 still_working_queues -= 1; // one less queue to work on
+                                // if (i % num_warps_per_group == 0 && lane_id == 0) {
+                                //     if (-num_recv_tokens - 1 >= 0) {
+                                //         printf("[rank %d]: round 0x%x expert %d already got %d tokens from rank %d, enough\n", rank, dispatch_round_n, rsp_exp_idx % num_local_experts + rank * num_local_experts, -num_recv_tokens - 1, rsp_exp_idx / num_local_experts);
+                                //     } else {
+                                //         printf("[rank %d]: round 0x%x expert %d already got %d tokens from rank %d, possibly enough\n", rank, dispatch_round_n, rsp_exp_idx % num_local_experts + rank * num_local_experts, num_max_dispatch_tokens_per_rank, rsp_exp_idx / num_local_experts);
+                                //     }
+                                // }
                                 break;
                             }
                             int num_recv_tokens_ref = num_recv_tokens;
@@ -595,6 +610,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             }
         }
     }
+    //cg::this_grid().sync();
+    //if (sm_id == 0 && thread_id == 0) printf("[rank %d]: round 0x%x dispatch done\n", rank, dispatch_round_n);
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
@@ -894,17 +911,19 @@ combine(void* combined_x,
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_COMBINE_RECV;
 
-    // Clean up next buffer
-    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
-        #pragma unroll
-        for (int i = lane_id; i < num_next_clean_int; i += 32)
-            next_clean[i] = 0;
+    if constexpr (kEager_combine != EAGER_FULL) {
+        // Clean up next buffer
+        if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+            #pragma unroll
+            for (int i = lane_id; i < num_next_clean_int; i += 32)
+                next_clean[i] = 0;
 
-        // Notify before executing `int_p`
-        __syncwarp();
-        if (kEager_combine != EAGER_FULL) {
-            if (lane_id == 0)
+            // Notify before executing `int_p`
+            __syncwarp();
+            
+            if (lane_id == 0) {
                 atomic_add_release_global(atomic_clean_flag, num_experts);
+            }
         }
     }
 
@@ -1103,14 +1122,15 @@ combine(void* combined_x,
             }
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
             auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            const int st_value = kEager_combine == EAGER_FULL ? (1 | SHORT_TAG(combine_round_n)) : 1;
             if (dst_p2p_ptr == 0) {
-                if (kEager <= EAGER_OFF) {
-                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                if (kEager_combine <= EAGER_OFF) {
+                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), st_value, dst_rank, local_expert_idx);
                 } else {
-                    nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                    nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), st_value, dst_rank, local_expert_idx);
                 }
             } else {
-                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
+                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), st_value);
             }
             if (kEager_combine != EAGER_FULL) {
                 atomic_add_release_global(atomic_clean_flag, -1);

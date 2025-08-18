@@ -65,6 +65,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
+    #topk_idx = torch.stack([(torch.arange(num_topk) + i + num_experts // num_ranks * rank) % num_experts for i in range(num_tokens)]).cuda()
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
 
     # Randomly mask some positions
@@ -81,6 +82,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
+                            #print(f'[rank {rank}]: dispatch func {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {return_recv_hook=}, round={i}/{num_times % 2 + 1}', flush=True)
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
@@ -178,17 +180,18 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
-        #print(f'[rank {rank}]: test dispatch begin') if rank == 0 else None
+        #print(f'[rank {rank}]: test dispatch begin', flush=True)
         recv_x, recv_count, handle, event, hook = \
             buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                         use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
         large_gemm_with_hook(hook) if return_recv_hook else None
-        #print(f'[rank {rank}]: test combine begin') if rank == 0 else None
+        #print(f'[rank {rank}]: test combine begin', flush=True)
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
         large_gemm_with_hook(hook) if return_recv_hook else None
-        #print(f'[rank {rank}]: test combine end') if rank == 0 else None
+        #print(f'[rank {rank}]: test combine end', flush=True) 
+        #dist.barrier()
 
     # Calculate bandwidth
     num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
@@ -229,6 +232,18 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     eager_support = eager_opt != deep_ep.Buffer.EAGER_OFF
     repeat = args.repeat
 
+    use_sep_stdout = args.sep_out_pfx is not None
+    if use_sep_stdout:
+        import sys
+        original_stdout_fd = sys.stdout.fileno()
+        original_stderr_fd = sys.stderr.fileno()
+        saved_stdout_fd = os.dup(original_stdout_fd)
+        saved_stderr_fd = os.dup(original_stderr_fd)
+        newout = open(f'{args.sep_out_pfx}_{rank}.txt', 'w')
+        os.dup2(newout.fileno(), original_stdout_fd)
+        os.dup2(newout.fileno(), original_stderr_fd)
+        print(f'[rank {rank}]: use seperate stdout/stderr', flush=True)
+
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts, eager_support)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
@@ -254,6 +269,11 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer.destroy()
     dist.barrier()
     dist.destroy_process_group()
+    print(f'[rank {rank}] test OK', flush=True)
+    if use_sep_stdout:
+        os.dup2(saved_stdout_fd, original_stdout_fd)
+        os.dup2(saved_stderr_fd, original_stderr_fd)
+        newout.close()
 
 
 if __name__ == '__main__':
@@ -282,6 +302,8 @@ if __name__ == '__main__':
                         help='eager_opt, 0: LOAD, 1: OFF, 2: CHK, 3: FULL (default: OFF)')
     parser.add_argument("--repeat", type=int, default=1,
                         help="performance test repeat times (default: 1)")
+    parser.add_argument("--sep-out-pfx", type=str, default=None,
+                        help="split output file prefix for each rank, stored as <prefix>_<rank>.txt, default: None, means mixed stdout")
     args = parser.parse_args()
 
     num_processes = args.num_processes

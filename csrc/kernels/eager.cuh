@@ -108,6 +108,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 #define EXT_PAGE_N(size) CEIL_DIV(size, PCIE_SEG_LEN)
 
 #define ZTAG(tag) (tag + TAG_V_OFFSET)
+#define SHORT_TAG(tag) ((((tag) % 0xffff) + 1) << 16)
 
 #define PARALLEL_SET_TAG(send_buf, len, tagv, exec_id, exec_total, st_func) {\
     const int __pages = PAGE_N(len);\
@@ -175,6 +176,12 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
     if (exec_id == 0 && count_value == 0) {\
         count_value = ld_acquire_sys_global(count_ptr);\
+        if ((count_value & 0xffff0000) == SHORT_TAG(tagv)) {\
+            count_value = (count_value | 0xffff0000);\
+        } else {\
+            /*printf("[rank %d]: expert %d from %d, cnt tag mismatch, 0x%x != 0x%x\n", rank, global_expert_idx, src_rank, (count_value >> 16) & 0xffff, (tagv % 0xffff) + 1)*/;\
+            count_value = 0;\
+        }\
     }\
     __syncwarp();\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
