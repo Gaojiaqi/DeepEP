@@ -16,22 +16,45 @@ def eq_range(tensor : torch.Tensor, value : float):
     last_eq = -2
     eq_start = None
     for i in range(tensor.shape[0]):
-        if tensor[i] == value:
+        if (np.isnan(value) and torch.isnan(tensor[i]).item()) or ((not np.isnan(value)) and tensor[i] == value):
             if last_eq != i - 1:
                 eq_start = i
             last_eq = i
         else:
             if last_eq == i - 1:
-                ranges.append((eq_start, i))
+                ranges.append([eq_start, i])
     if last_eq == tensor.shape[0] - 1:
-        ranges.append((eq_start, tensor.shape[0]))
+        ranges.append([eq_start, tensor.shape[0]])
     return ranges
 
+def split_range(tensor : torch.Tensor, values : set):
+    r = {v : [] for v in values}
+    cur_v = None
+    cur_start = None
+    for i in range(tensor.shape[0]):
+        if cur_v is None:
+            cur_v = tensor[i].item()
+            cur_start = i
+        elif (np.isnan(cur_v) and np.isnan(tensor[i].item())) or cur_v == tensor[i].item():
+            continue
+        else:
+            r[cur_v].append(f'{cur_start}, {i}')
+            cur_v = tensor[i].item()
+            cur_start = i
+    r[cur_v].append(f'{cur_start}, {tensor.shape[0]}')
+    return r
+
+import json
 def all_value_range(tensor : torch.Tensor, except_zero : bool = False):
-    values = set(tensor.float().cpu().numpy())
+    fvalues = list(tensor.float().cpu().numpy())
+    values = set([v for v in fvalues if not np.isnan(v)])
+    hasnan = any([np.isnan(v) for v in fvalues])
+    if hasnan:
+        values.add(np.nan)
     if except_zero:
         values.remove(0)
-    return [(v, eq_range(tensor, v)) for v in values]
+    d = split_range(tensor=tensor, values=values)
+    return '\n' + json.dumps({str(v): r for v, r in d.items()}, indent=4) + '\n'
 
 def dump_nan_tensors(tensor : torch.Tensor):
     r = []
@@ -123,14 +146,14 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 recv_x_amin = recv_x[:, :-128].amin(dim=-1)
                                 recv_src_info = recv_src_info[:num_valid_tokens]
                                 if not torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)):
-                                    print(f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={[all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])]}')
+                                    print(f'[rank {rank}]: Error token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}')
                                 else:
-                                    assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={[all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])]}'
+                                    assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}'
                                     if round_scale:
                                         assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
                                     else:
-                                        assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: exp {expert_id}, {num_valid_tokens} tokens, token second part, min range {all_value_range(recv_x[:, -128:].amin(dim=-1))}, max range {all_value_range(recv_x[:, -128:].amax(dim=-1))}'
-                                        assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
+                                        assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: Error exp {expert_id}, {num_valid_tokens} tokens, token second part, min range {all_value_range(recv_x[:, -128:].amin(dim=-1))}, max range {all_value_range(recv_x[:, -128:].amax(dim=-1))}'
+                                        assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: Error exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
                                     for j in range(num_ranks):
                                         if eager_opt != deep_ep.Buffer.EAGER_FULL:
                                             begin_idx, count = (recv_layout_range[j] >> 32).item(), (recv_layout_range[j] & int_mask).item()

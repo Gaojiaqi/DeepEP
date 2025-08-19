@@ -1191,6 +1191,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {
         ll_dispatch_round_n += ll_dispatch_round_n == 0xffffffff ? 2 : 1; // do not hit zero
+        //printf("[rank %d]: dispatch round updated to 0x%x\n", rank, ll_dispatch_round_n);
     }
     // Wait streams
     std::optional<EventHandle> event;
@@ -1208,6 +1209,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         recv_hook = [=]() { 
             launcher(LOW_LATENCY_RECV_PHASE);
             ll_dispatch_round_n += ll_dispatch_round_n == 0xffffffff ? 2 : 1; // do not hit zero 
+            //printf("[rank %d]: dispatch round updated to 0x%x\n", rank, ll_dispatch_round_n);
         };
 
     // Return values
@@ -1302,6 +1304,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {
         ll_combine_round_n += ll_combine_round_n == 0xffffffff ? 2 : 1; // do not hit zero
+        //printf("[rank %d]: combine round updated to 0x%x\n", rank, ll_combine_round_n);
     }
 
     // Wait streams
@@ -1320,6 +1323,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
         recv_hook = [=]() { 
             launcher(LOW_LATENCY_RECV_PHASE); 
             ll_combine_round_n += ll_combine_round_n == 0xffffffff ? 2 : 1; // do not hit zero
+            //printf("[rank %d]: combine round updated to 0x%x\n", rank, ll_combine_round_n);
         };
 
     // Return values

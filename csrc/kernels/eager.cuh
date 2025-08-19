@@ -164,6 +164,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             }\
             if (count_value == 0) {\
                 count_value = ld_acquire_sys_global(count_ptr);\
+                count_value = ((count_value & 0xffff0000) == SHORT_TAG(tagv)) ? (count_value | 0xffff0000) : 0;\
                 if (count_value != 0 && token_idx >= (-count_value-1)) {\
                     break;\
                 }\
