@@ -1341,7 +1341,7 @@ combine(void* combined_x,
                                 // space_ptr[1] = space_ptr[0];
                                 //EP_DEVICE_ASSERT(reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id] == space);
                                 //printf("[rank %d]: debug: wriring shmem\n", rank);
-                                int save_value = ld_nc_global(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + kHidden * sizeof(nv_bfloat16) + lane_id * sizeof(int))); // reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id]
+                                int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + kHidden * sizeof(nv_bfloat16) + lane_id * sizeof(int))); // reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id]
                                 //INT_VALUE_NO_NAN(save_value);
                                 st_release_cta(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + (lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ)), save_value);
                             }
