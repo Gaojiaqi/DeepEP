@@ -34,6 +34,9 @@ namespace deep_ep {
 #define FULL_MSG_LEN(size) ((size) + (PAGE_N(size) * PCIE_TAIL_SZ))
 #define EXTEND_FOR_TAG_AND_ALIGN(size, alignment) CEIL_ALIGN(FULL_MSG_LEN(size), alignment)
 
+#define DISPATCH_ROUND_INT 0x40000000
+#define COMBINE_ROUND_INT 0xc0000000
+
 #ifdef __CUDACC__
 
 #include "utils.cuh"
@@ -103,17 +106,21 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 #define SHIFTED_ADDR(a) (a + ((a) / (PCIE_SEG_LEN - PCIE_TAIL_SZ)) * PCIE_TAIL_SZ)
 #define PTR_DIFF(a, b) (reinterpret_cast<uint8_t*>(a) - reinterpret_cast<uint8_t*>(b))
 #define SHIFTED_ADDR_P(ptr, bptr) (ptr + ((PTR_DIFF(ptr, bptr) / (PCIE_SEG_LEN - PCIE_TAIL_SZ))) * PCIE_TAIL_SZ / sizeof(*(ptr)))
+#define SHIFTED_ADDR_PS(ptr, bptr, smsglen) SHIFTED_ADDR_P(ptr + (PTR_DIFF(ptr, bptr) >= smsglen ? (sizeof(int4) / sizeof(*(ptr))) : 0), bptr)
 #define IS_PAGE_SUB_HEAD(ptr, bptr, size) (((PTR_DIFF(ptr, bptr) == (size)) || (PTR_DIFF(ptr, bptr) % (PCIE_SEG_LEN - PCIE_TAIL_SZ)) == 0))
 #define CHK_POSITION(bptr, size, pn, ptotal) (reinterpret_cast<uint8_t*>(bptr) + ((pn == ptotal - 1) ? SHIFTED_ADDR(size) : (((pn) << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ))))
 #define EXT_PAGE_N(size) CEIL_DIV(size, PCIE_SEG_LEN)
 
 #define ZTAG(tag) (tag + TAG_V_OFFSET)
-#define SHORT_TAG(tag) ((((tag) % 0xffff) + 1) << 16)
+#define TAG_CNT_MASK 0x3fffffff
+#define TAG_TYPE(tag) ((tag >> 31) & 1)
+#define SHORT_TAG(tag) (((TAG_TYPE(tag) << 15) | ((((tag) & TAG_CNT_MASK) % 0x7fff) + 1)) << 16)
 
 #define PARALLEL_SET_TAG(send_buf, len, tagv, exec_id, exec_total, st_func) {\
     const int __pages = PAGE_N(len);\
     for (int __pn = exec_id; __pn < __pages; __pn += exec_total) {\
         int *__check_ptr = reinterpret_cast<int*>(CHK_POSITION(send_buf, len, __pn, __pages));\
+        /*printf("[rank %d]: dispatch round 0x%08x st tag at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(__check_ptr, send_buf))*/;\
         /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(__check_ptr) % sizeof(int) == 0)*/;\
         st_func(__check_ptr, ZTAG(tagv));\
     }\
@@ -123,6 +130,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     __syncwarp();\
     /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(dst_buf + len) % sizeof(int) == 0)*/;\
     lane_id == 0 ? st_na_release(reinterpret_cast<int*>(dst_buf + len), ZTAG(tagv)) : void(0);\
+    /*if (lane_id == 0) printf("[rank %d]: dispatch round 0x%08x st tail tag at offset %lu\n", rank, dispatch_round_n, len)*/;\
 }
 
 #define WAIT_BIT(recv_buf, len, ext_len, exec_id, exec_total, tagv, intra_node) {\
@@ -155,7 +163,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
         int ld_value;\
-        int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, len, target, __page_n)) ;\
+        int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + msg_distance - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, len, target, __page_n)) ;\
         /*printf("[rank %d]: want to check int at offset: %lu\n", rank, reinterpret_cast<uint8_t*>(_check_ptr) - reinterpret_cast<uint8_t*>(recv_buf))*/;\
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\
@@ -208,6 +216,14 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 
 #define N_ST_SHIFTED(DST_PTR, VALUE, DST_BASE) ST_SHIFTED(NORMAL_ST, DST_PTR, DST_BASE, VALUE)
 
+#define LD_SHIFTED_S(LD_FUNC, SRC_PTR, SRC_BASE, SMSGLEN) LD_FUNC(SHIFTED_ADDR_PS(SRC_PTR, SRC_BASE, SMSGLEN))
+
+#define ST_SHIFTED_S(ST_FUNC, DST_PTR, DST_BASE, SMSGLEN, VALUE) ST_FUNC(SHIFTED_ADDR_PS(DST_PTR, DST_BASE, SMSGLEN), VALUE)
+
+#define N_LD_SHIFTED_S(SRC_PTR, SRC_BASE, SMSGLEN) LD_SHIFTED_S(NORMAL_LD, SRC_PTR, SRC_BASE, SMSGLEN)
+
+#define N_ST_SHIFTED_S(DST_PTR, VALUE, DST_BASE, SMSGLEN) ST_SHIFTED_S(NORMAL_ST, DST_PTR, DST_BASE, SMSGLEN, VALUE)
+
 #define UNROLLED_WARP_COPY_DST_AUTO_SHIFT(UNROLL_FACTOR, LANE_ID, N, DST, SRC, DST_RDMA_HEAD, LD_FUNC, ST_FUNC) \
 { \
     constexpr int kLoopStride = 32 * (UNROLL_FACTOR); \
@@ -227,7 +243,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(UNROLL_FACTOR, LANE_ID, N, DST, SRC, SRC_RDMA_HEAD, LD_FUNC, ST_FUNC) \
+#define UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(UNROLL_FACTOR, LANE_ID, N, DST, SRC, SRC_RDMA_HEAD, SMSGLEN, LD_FUNC, ST_FUNC) \
 { \
     constexpr int kLoopStride = 32 * (UNROLL_FACTOR); \
     typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)]; \
@@ -236,14 +252,24 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) { \
         _Pragma("unroll") \
         for (int __j = 0; __j < (UNROLL_FACTOR); ++ __j) {\
-            unrolled_values[__j] = LD_SHIFTED(LD_FUNC, __src + __i + __j * 32, SRC_RDMA_HEAD); \
+            if constexpr (kUseFP8) {\
+                unrolled_values[__j] = LD_SHIFTED(LD_FUNC, __src + __i + __j * 32, SRC_RDMA_HEAD); \
+            } else {\
+                unrolled_values[__j] = LD_SHIFTED_S(LD_FUNC, __src + __i + __j * 32, SRC_RDMA_HEAD, SMSGLEN); \
+                /*printf("[rank %d]: dispatch round 0x%08x load data at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(__src + __i + __j * 32, SRC_RDMA_HEAD, SMSGLEN), SRC_RDMA_HEAD))*/;\
+            }\
         }\
         _Pragma("unroll") \
         for (int __j = 0; __j < (UNROLL_FACTOR); ++ __j) \
             ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]); \
     } \
     for (int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID); __i < (N); __i += 32) {\
-        unrolled_values[0] = LD_SHIFTED(LD_FUNC, __src + __i, SRC_RDMA_HEAD);\
+        if constexpr (kUseFP8) {\
+            unrolled_values[0] = LD_SHIFTED(LD_FUNC, __src + __i, SRC_RDMA_HEAD);\
+        } else {\
+            unrolled_values[0] = LD_SHIFTED_S(LD_FUNC, __src + __i, SRC_RDMA_HEAD, SMSGLEN);\
+            /*printf("[rank %d]: dispatch round 0x%08x load data at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(__src + __i, SRC_RDMA_HEAD, SMSGLEN), SRC_RDMA_HEAD))*/;\
+        }\
         ST_FUNC(__dst + __i, unrolled_values[0]); \
     }\
 }
@@ -264,22 +290,25 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 }
 
 
-#define TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, gmem_base, tag_save, tagv, kparam, intra_node) {\
+#define TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, gmem_base, tag_save, smsglen, tagv, kparam) {\
     if constexpr (kparam != EAGER_OFF) {\
-        if (!intra_node) {\
+        if (true) {\
             /*printf("[rank %d]: debug: modifying smem\n", rank)*/;\
-            int __BASE_PN__ = PTR_DIFF(gmem_ptr, gmem_base) >> PCIE_SEG_LEN_LOG;\
-            int __TAIL_PN__ = (PTR_DIFF(gmem_ptr, gmem_base) + bytes) >> PCIE_SEG_LEN_LOG;\
+            const auto diff = PTR_DIFF(gmem_ptr, gmem_base);\
+            int __BASE_PN__ = diff >> PCIE_SEG_LEN_LOG;\
+            int __TAIL_PN__ = (diff + bytes) >> PCIE_SEG_LEN_LOG;\
             if (__BASE_PN__ != __TAIL_PN__) {\
-                int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (PTR_DIFF(gmem_ptr, gmem_base) & PCIE_SEG_LEN_MASK);\
-                if (tag_tma_offset + sizeof(int) > kNumTMABufferBytes) {\
-                    printf("tma offset error: gmem ptr %lu tma len %lu. %s:%d\n", PTR_DIFF(gmem_ptr, gmem_base), static_cast<size_t>(bytes), __FILE__, __LINE__);\
-                    asm("trap;");\
-                }\
-                /*printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + PTR_DIFF(gmem_ptr, gmem_base))*/;\
+                int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
                 tag_save[__BASE_PN__] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
-                INT_VALUE_NO_NAN(tag_save[__BASE_PN__]);\
+                /*printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + diff, tag_save[__BASE_PN__], __BASE_PN__)*/;\
+                /*INT_VALUE_NO_NAN(tag_save[__BASE_PN__])*/;\
                 *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset) = ZTAG(tagv);\
+            }\
+            if (smsglen >= diff && smsglen < diff + bytes) {\
+                const auto jump_tag_offset = (smsglen & PCIE_SEG_LEN_MASK) - (diff & PCIE_SEG_LEN_MASK);\
+                tag_save[MAX_PAGES+1] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset);\
+                /*printf("[rank %d]: exp %d send back rank %d token %d, insert jump tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, jump_tag_offset + diff, tag_save[MAX_PAGES+1], MAX_PAGES+1)*/;\
+                *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset) = 0;\
             }\
         }\
     }\

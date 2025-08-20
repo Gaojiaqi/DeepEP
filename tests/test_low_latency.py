@@ -63,6 +63,8 @@ def dump_nan_tensors(tensor : torch.Tensor):
             r.append((i, all_value_range(torch.isnan(tensor[i]), except_zero=True)))
     return '\n'.join([str(x) for x in r])
 
+dispatch_round = 0x40000000
+combine_round = 0xc0000000
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: deep_ep.Buffer,
               use_logfmt: bool = False, seed: int = 0, eager_opt: int = 1, repeat: int = 1):
@@ -95,6 +97,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     for i in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
+    global dispatch_round, combine_round
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
@@ -105,7 +108,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
-                            #print(f'[rank {rank}]: dispatch func {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {return_recv_hook=}, round={i}/{num_times % 2 + 1}', flush=True)
+                            print(f'[rank {rank}]: dispatch func {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {return_recv_hook=}, round={i}/{num_times % 2 + 1}, cnt=0x{dispatch_round:x}', flush=True)
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
@@ -113,6 +116,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                                             async_finish=not return_recv_hook, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
                             hook() if return_recv_hook else event.current_stream_wait()
+                            dispatch_round += 1
                         packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
                         simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                             if dispatch_use_fp8 else packed_recv_x.clone()
@@ -146,11 +150,14 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 recv_x_amin = recv_x[:, :-128].amin(dim=-1)
                                 recv_src_info = recv_src_info[:num_valid_tokens]
                                 if not torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)):
-                                    print(f'[rank {rank}]: Error token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}')
+                                    print(f'[rank {rank}]: Error expert {expert_id} token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}')
                                 else:
                                     assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}'
                                     if round_scale:
-                                        assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
+                                        if calc_diff(recv_x[:, -1], recv_src_info.view(-1)) >= 0.007:
+                                            print(f'[rank {rank}]: Error expert {expert_id} src info != recv_x second part, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, second part range={all_value_range(recv_x[:, -1])}, src info range={all_value_range(recv_src_info.view(-1))}')
+                                        else:
+                                            assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
                                     else:
                                         assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: Error exp {expert_id}, {num_valid_tokens} tokens, token second part, min range {all_value_range(recv_x[:, -128:].amin(dim=-1))}, max range {all_value_range(recv_x[:, -128:].amax(dim=-1))}'
                                         assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: Error exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
@@ -174,7 +181,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                            #print(f'[rank {rank}]: combine {dispatch_use_fp8=} {return_recv_hook=} {round_scale=} {use_ue8m0=} {use_logfmt=} {zero_copy=}') if rank == 0 else None
+                            print(f'[rank {rank}]: combine {dispatch_use_fp8=} {return_recv_hook=} {round_scale=} {use_ue8m0=} {use_logfmt=} {zero_copy=} cnt=0x{combine_round:x}', flush=True)
                             combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                                                 use_logfmt=use_logfmt,
                                                                                 async_finish=not return_recv_hook, zero_copy=zero_copy,
@@ -182,6 +189,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             #print(f'[rank {rank}]: combine done') if rank == 0 else None
                             hook() if return_recv_hook else event.current_stream_wait()
                             #print(f'[rank {rank}]: hook done') if rank == 0 else None
+                            combine_round += 1
                             if do_check:
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
                                 if torch.isnan(combined_x).sum().item() != 0:
@@ -232,6 +240,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
         # Separate profiling
+        #continue
         for return_recv_hook in (False, True):
             group.barrier()
             dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=return_recv_hook),

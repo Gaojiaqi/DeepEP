@@ -70,6 +70,7 @@ __device__ __inline__ bool eager_dispatch_recv_token(
     const auto lane_id = get_lane_id();
     constexpr int kNumPerChannels = 128;
     constexpr int num_scales = kHidden / kNumPerChannels;
+    constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag jump position
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
     const auto src_rank = responsible_expert_idx / num_local_experts;
@@ -96,7 +97,7 @@ __device__ __inline__ bool eager_dispatch_recv_token(
     int ready = 1;
     constexpr int kEager = EAGER_FULL;
     
-    TRY_2BIT(src_src_idx, num_bytes_per_msg_v, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, ready, i, ld_intra_node);
+    TRY_2BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, ready, i, ld_intra_node);
     ready = warp_reduce_min(ready);
     if (ready == 0) return false; // this token is not ready, go to next token
     
@@ -121,7 +122,7 @@ __device__ __inline__ bool eager_dispatch_recv_token(
     const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
     const auto dst_data = recv_x_int4 + this_token_index_in_recv * hidden_int4;
     //if (kEager != EAGER_OFF) {
-    UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(5, lane_id, hidden_int4, dst_data, src_data, src_src_idx, ld_nc_global, st_na_global);  
+    UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(5, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);  
     // } else {
     //     UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
     // }
@@ -191,17 +192,22 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     // Message package: hidden data, FP8 scales, index at source
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t num_bytes_per_msg_v = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
-    const size_t num_bytes_per_msg = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_msg_v, AR_MSG_ALIGNMENT) : num_bytes_per_msg_v;
+    constexpr size_t num_bytes_per_msg_v = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    constexpr size_t num_bytes_per_msg = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), AR_MSG_ALIGNMENT) : num_bytes_per_msg_v;
+    // long message shall use extra int4 to jump the last tag of short message
     
     // WARNING!!! Two lines below must be consistent with msg def in config.hpp
     constexpr size_t dispatch_msg_max = sizeof(int4) + std::max(kHidden * sizeof(nv_bfloat16), kHidden + num_scales * sizeof(float));
     constexpr size_t combine_msg_max = num_scales * sizeof(nv_bfloat162) + kHidden * sizeof(nv_bfloat16);
-    constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_msg_v;
+    constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int4), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_msg_v;
+    constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag jump position
+    //constexpr size_t long_msg_len = sizeof(int4) + kHidden * sizeof(nv_bfloat16); // BF16 dispatch / combine msg len;
 
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
-    
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("[rank %d]: target tag = 0x%x short tag = 0x%08x, msg_distance = %lu, num_bytes_per_msg = %lu, short_msg = %lu\n", rank, ZTAG(dispatch_round_n), SHORT_TAG(dispatch_round_n), msg_distance, num_bytes_per_msg, short_msg_len);
+    // }
     //if (sm_id == 0 && thread_id == 0) printf("[rank %d]: kEager = %d\n", rank, kEager);
     // Expert counts
     constexpr int kNumMaxWarpGroups = 32;
@@ -232,7 +238,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
 #define DISPATCH_ST(PTR, VALUE) {\
     if constexpr (kEager != EAGER_OFF) {\
-        N_ST_SHIFTED(PTR, VALUE, rdma_x_src_idx);\
+        if constexpr (kUseFP8) {\
+            N_ST_SHIFTED(PTR, VALUE, rdma_x_src_idx);\
+        } else {\
+            N_ST_SHIFTED_S(PTR, VALUE, rdma_x_src_idx, short_msg_len);\
+            /*printf("[rank %d]: dispatch round 0x%08x st at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len), rdma_x_src_idx))*/;\
+        }\
     } else {\
         NORMAL_ST(PTR, VALUE);\
     }\
@@ -286,7 +297,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 const auto warp_runs = hidden_bf16_int4 / 32;
                 const auto idle_warp_id = (warp_id + (num_warps - 1) - (warp_runs % (num_warps - 1))) % (num_warps - 1);
                 if (idle_warp_id == 0) {
-                    PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg_v, dispatch_round_n, lane_id, 32, NORMAL_ST);
+                    PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), dispatch_round_n, lane_id, 32, NORMAL_ST);
                 }
             }
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
@@ -313,7 +324,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-                    WARP_SET_TAIL_TAG(dst_p2p_ptr, num_bytes_per_msg, dispatch_round_n);
+                    WARP_SET_TAIL_TAG(dst_p2p_ptr, msg_distance - sizeof(int4), dispatch_round_n);
                 }
 
                 // Increase counter after finishing
@@ -439,7 +450,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
-        const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
+        //const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
         const auto rdma_recv_x_uint8 = static_cast<uint8_t*>(rdma_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * msg_distance +
                 src_rank * num_max_dispatch_tokens_per_rank * msg_distance;
@@ -491,7 +502,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * msg_distance);
 
                 if (kEager == EAGER_FULL) {
-                    WAIT_2BIT(src_src_idx, num_bytes_per_msg_v, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node);
+                    WAIT_2BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node);
                     __syncwarp();
                     num_recv_tokens = warp_reduce_min(num_recv_tokens);
                     
@@ -508,7 +519,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     __syncwarp();
                     this_token_index_in_recv = __shfl_sync(0xffffffff, this_token_index_in_recv, 0);
                 } else if constexpr (kEager != EAGER_OFF) {
-                    WAIT_BIT(src_src_idx, num_bytes_per_msg_v, num_bytes_per_msg, lane_id, 32, dispatch_round_n, ld_intra_node);
+                    WAIT_BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, ld_intra_node);
                     __syncwarp();
                 }
                 if constexpr (kEager != EAGER_FULL) {
@@ -524,7 +535,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
                 const auto dst_data = recv_x_int4 + this_token_index_in_recv * hidden_int4;
                 if constexpr (kEager != EAGER_OFF) {
-                    UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, ld_nc_global, st_na_global);  
+                    UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);  
                 } else {
                     UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
                 }
@@ -894,7 +905,18 @@ combine(void* combined_x,
     constexpr int num_scales = kHidden / kNumPerChannels;
     constexpr size_t dispatch_msg_max = sizeof(int4) + std::max(kHidden * sizeof(nv_bfloat16), kHidden + num_scales * sizeof(float));
     constexpr size_t combine_msg_max = num_scales * sizeof(nv_bfloat162) + kHidden * sizeof(nv_bfloat16);
-    constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_slot_v;
+    constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int4), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_slot_v;
+
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("[rank %d]: target tag = 0x%x short tag = 0x%08x, msg_distance = %lu, num_bytes_per_slot = %lu\n", rank, ZTAG(combine_round_n), SHORT_TAG(combine_round_n), msg_distance, num_bytes_per_slot);
+    // }
+
+    constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag jump position
+    constexpr size_t short_msg_ext_len = SHIFTED_ADDR(short_msg_len);
+    constexpr size_t long_msg_len = sizeof(int4) + kHidden * sizeof(nv_bfloat16); // BF16 dispatch / combine msg len;
+    //constexpr size_t long_msg_len_int4 = long_msg_len / sizeof(int4);
+    constexpr size_t long_msg_ext_len = EXTEND_FOR_TAG_AND_ALIGN(long_msg_len, sizeof(int4));
+    constexpr size_t long_msg_ext_len_int4 = long_msg_ext_len / sizeof(int4);
 
     constexpr int kEager_combine = kUseLogFMT ? EAGER_OFF : kEager; // logfmt does not support eager combine
     constexpr int MAX_PAGES_DIV4 = 1;
@@ -1050,7 +1072,7 @@ combine(void* combined_x,
                         tma_offset_bytes += num_tma_bytes;
                     } else {
                         // BF16 original values
-#define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, combine_round_n, kEager_combine, intra_node)
+#define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, short_msg_ext_len, combine_round_n, kEager_combine)
                         if ((kEager_combine != EAGER_OFF) ? (lane_id == 0) : elect_one_sync(lane_id)) { // force lane 0 to issue tma
                             auto w_offset_int4 = iter_idx * kNumSendUnrolls * 32; // i is dynamic...
                             COMBINE_SEND_TMA(tma_store_1d, tma_buffers[stage_idx], cpy_dst_int4_ptr + w_offset_int4, get_num_tma_bytes(w_offset_int4));
@@ -1070,11 +1092,11 @@ combine(void* combined_x,
                 if constexpr (kEager_combine != EAGER_OFF) {
                     // inter_node: write tag save value
                     
-                    if (!intra_node) {
+                    if (true) {
                         // reduce or because tags may be stored in different lanes, maybe there is a better way, why just use lane 0 to do tma? If so, reduce can be replaced by shfl_sync
                         __syncwarp();
                         #pragma unroll
-                        for (int __pn = 0; __pn < MAX_PAGES; ++__pn) {
+                        for (int __pn = 0; __pn <= MAX_PAGES + 1; ++__pn) {
                             //__tail_tags[__pn] = warp_reduce_or(__tail_tags[__pn]);
                             __tail_tags[__pn] = __shfl_sync(0xffffffff, __tail_tags[__pn], 0);
                         }
@@ -1082,9 +1104,9 @@ combine(void* combined_x,
                         //EP_DEVICE_ASSERT(lane_id == get_lane_id());
                         EP_STATIC_ASSERT((kHidden * sizeof(nv_bfloat16)) % sizeof(int4) == 0, "combine message len (no logfmt) shall be a multiple of int4");
                         if (lane_id < MAX_PAGES_DIV4 + 1) {
-                            auto target_ptr = cpy_dst_int4_ptr + hidden_bf16_int4 + lane_id;
+                            auto target_ptr = cpy_dst_int4_ptr + (lane_id < MAX_PAGES_DIV4 ? (hidden_bf16_int4 + lane_id) : (long_msg_ext_len_int4 - 1));
                             //EP_DEVICE_ASSERT((target_ptr + 1 - cpy_dst_int4_ptr) * sizeof(int4) <= msg_distance);
-                            //printf("[rank %d]: exp %d send back rank %d token %d, put stored value and last tag, offset %lu\n", rank, global_expert_idx, dst_rank, src_idx, (target_ptr - cpy_dst_int4_ptr) * sizeof(int4));
+                            /*printf("[rank %d]: exp %d send back rank %d token %d, put %d stored value and last tag, {0x%08x, 0x%08x, 0x%08x, 0x%08x} offset %lu\n", rank, global_expert_idx, dst_rank, src_idx, lane_id, __tail_tags_int4[lane_id].x, __tail_tags_int4[lane_id].y, __tail_tags_int4[lane_id].z, __tail_tags_int4[lane_id].w, (target_ptr - cpy_dst_int4_ptr) * sizeof(int4));*/
                             // if (lane_id == MAX_PAGES_DIV4) EP_DEVICE_ASSERT(__tail_tags_int4[lane_id].x == ZTAG(combine_round_n));
                             // if (lane_id < MAX_PAGES_DIV4) {
                             //     INT_VALUE_NO_NAN(__tail_tags_int4[lane_id].x);
@@ -1095,7 +1117,7 @@ combine(void* combined_x,
                             st_na_release(target_ptr, __tail_tags_int4[lane_id]);
                         }
                         __syncwarp();
-                        num_send_bytes = CEIL_ALIGN(num_send_bytes, sizeof(int4)) + (MAX_PAGES_DIV4 + 1) * sizeof(int4); // extra tag store space
+                        num_send_bytes = EXTEND_FOR_TAG_AND_ALIGN(long_msg_len, sizeof(int4)); // extra tag store space
                     }
                 }
 
@@ -1105,7 +1127,8 @@ combine(void* combined_x,
                 if constexpr (kEager_combine != EAGER_OFF) {
                     if (intra_node && lane_id == 0) {
                         // intranode: only write last tag to signal token ready!
-                        st_release_sys_global(reinterpret_cast<int*>(cpy_dst_int4_ptr + hidden_bf16_int4 + MAX_PAGES_DIV4), ZTAG(combine_round_n));
+                        st_release_sys_global(reinterpret_cast<int*>(cpy_dst_int4_ptr + msg_distance / sizeof(int4) - 1), ZTAG(combine_round_n));
+                        //printf("[rank %d]: exp %d send back rank %d token %d, put intra node tag, offset %lu\n", rank, global_expert_idx, dst_rank, src_idx, msg_distance - sizeof(int4));
                     }
                 }
             }
@@ -1190,13 +1213,13 @@ combine(void* combined_x,
 
     if (group_idx < num_groups) {
         constexpr int kNumStages = 3;
-        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2 + ((kEager_combine == EAGER_OFF) ? 0 : ((MAX_PAGES_DIV4) * sizeof(int4))); // WARNING: use metabytes for logfmt, assume redundant region is enough!
+        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2 + ((kEager_combine == EAGER_OFF) ? 0 : (PAGE_N(long_msg_len) * sizeof(int4))); // WARNING: use metabytes for logfmt, assume redundant region is enough!
         constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
         constexpr int kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10;
         constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
         constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * 2 + kNumStages * kNumDivisionBytes * 3;
 
-        __shared__ int4 ld_tags_int4[kMaxNumGroups][kNumStages][MAX_PAGES_DIV4];
+        //__shared__ int4 ld_tags_int4[kMaxNumGroups][kNumStages][MAX_PAGES_DIV4];
 
         // Reallocate shared memory
         const auto smem_group_buffer = smem_buffer + kNumBytesPerGroup * group_idx;
@@ -1243,20 +1266,19 @@ combine(void* combined_x,
                     auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
                     //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0) printf("tma load warp pass mbarrier\n");
                     if constexpr (kEager_combine != EAGER_OFF) {
-                        constexpr int pages = CEIL_DIV(kHidden * sizeof(nv_bfloat16), PCIE_SEG_LEN);
-                        constexpr int last_page_part = (kHidden * sizeof(nv_bfloat16)) & PCIE_SEG_LEN_MASK;
-                        constexpr int full_last_page = last_page_part == 0 ? 1 : 0;
+                        constexpr int pages = PAGE_N(long_msg_len);
                         if (intra_node) {
                             // intra node: just check tail tag
                             if (lane_id == 0) {
-                                int *__check_ptr = reinterpret_cast<int*>(buffer + kHidden * sizeof(nv_bfloat16) + MAX_PAGES_DIV4 * sizeof(int4));
+                                int *__check_ptr = reinterpret_cast<int*>(buffer + msg_distance - sizeof(int4));
+                                //printf("[rank %d]: combine check intra node tag at offset %lu\n", rank, msg_distance - sizeof(int4));
                                 while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
                             }
                         } else {
                             // inter node: check tags of all pages
                             #pragma unroll
-                            for (int __pn = lane_id; __pn < pages + full_last_page; __pn += 32) {
-                                int *__check_ptr = reinterpret_cast<int*>(buffer + (__pn << PCIE_SEG_LEN_LOG) + ((__pn == pages + full_last_page - 1) ? (last_page_part + MAX_PAGES_DIV4 * sizeof(int4)) : (PCIE_SEG_LEN - PCIE_TAIL_SZ)));
+                            for (int __pn = lane_id; __pn < pages; __pn += 32) {
+                                int *__check_ptr = reinterpret_cast<int*>(buffer + ((__pn == pages - 1) ? (long_msg_ext_len - sizeof(int4)) : ((__pn << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
                                 //EP_DEVICE_ASSERT(reinterpret_cast<uint8_t*>(__check_ptr) - buffer + sizeof(int) <= msg_distance);
                                 //printf("[rank %d]: token %d topk %d from exp %d at rank %d, check offset %lu\n", rank, token_idx, i, topk_idx_reg, src_rank, reinterpret_cast<uint8_t*>(__check_ptr) - buffer);
                                 while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
@@ -1287,7 +1309,7 @@ combine(void* combined_x,
                         }
                         int num_tma_bytes;
                         if constexpr (kEager_combine != EAGER_OFF) {
-                            num_tma_bytes = kHidden * sizeof(nv_bfloat16) + MAX_PAGES_DIV4 * sizeof(int4);
+                            num_tma_bytes = long_msg_ext_len;
                         } else {
                             num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
                         }
@@ -1325,14 +1347,14 @@ combine(void* combined_x,
                     if (topk_idx < 0)
                         continue;
                     const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
-                    const auto intra_node = ((topk_idx / num_local_experts) >> 3) == (rank >> 3);
+                    //const auto intra_node = ((topk_idx / num_local_experts) >> 3) == (rank >> 3);
                     //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0 && decode_warp_idx == 0) printf("reduce warp wait on barrier\n");
                     mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
                     //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0 && decode_warp_idx == 0) printf("reduce warp pass barrier\n");
                     if constexpr (kEager_combine != EAGER_OFF) {
-                        auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
-                        constexpr int pages = (kHidden * sizeof(nv_bfloat16)) >> PCIE_SEG_LEN_LOG;
-                        if (!intra_node) {
+                        //auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
+                        constexpr int pages = PAGE_N(long_msg_len);
+                        if (true) {
                             if (decode_warp_idx == 0 && lane_id < pages) {
                                 //EP_DEVICE_ASSERT((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ) < kHidden * sizeof(nv_bfloat16) - sizeof(int));
                                 // int space;
@@ -1341,9 +1363,12 @@ combine(void* combined_x,
                                 // space_ptr[1] = space_ptr[0];
                                 //EP_DEVICE_ASSERT(reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id] == space);
                                 //printf("[rank %d]: debug: wriring shmem\n", rank);
-                                int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + kHidden * sizeof(nv_bfloat16) + lane_id * sizeof(int))); // reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id]
+                                const auto ld_offset = (lane_id < pages - 1) ? (kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id) : (long_msg_ext_len - sizeof(int4) + sizeof(int));
+                                const auto st_offset = (lane_id < pages - 1) ? ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ)) : short_msg_ext_len;
+                                int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + ld_offset)); // reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id]
+                                //printf("[rank %d]: combine restore value 0x%08x from %lu to %lu\n", rank, save_value, ld_offset, st_offset);
                                 //INT_VALUE_NO_NAN(save_value);
-                                st_release_cta(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + (lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ)), save_value);
+                                st_release_cta(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + st_offset), save_value);
                             }
                             asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));
                         }

@@ -81,8 +81,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         *moe_recv_rdma_counter = -1;
     }
     this->eager_support = eager_support;
-    ll_dispatch_round_n = 0x40000000;
-    ll_combine_round_n = 0xc0000000;
+    ll_dispatch_round_n = DISPATCH_ROUND_INT;
+    ll_combine_round_n = COMBINE_ROUND_INT;
 }
 
 Buffer::~Buffer() noexcept(false) {
@@ -1190,7 +1190,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {
-        ll_dispatch_round_n += ll_dispatch_round_n == 0xffffffff ? 2 : 1; // do not hit zero
+        ll_dispatch_round_n = (ll_dispatch_round_n + 1) | DISPATCH_ROUND_INT;
         //printf("[rank %d]: dispatch round updated to 0x%x\n", rank, ll_dispatch_round_n);
     }
     // Wait streams
@@ -1208,7 +1208,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     if (return_recv_hook)
         recv_hook = [=]() { 
             launcher(LOW_LATENCY_RECV_PHASE);
-            ll_dispatch_round_n += ll_dispatch_round_n == 0xffffffff ? 2 : 1; // do not hit zero 
+            ll_dispatch_round_n = (ll_dispatch_round_n + 1) | DISPATCH_ROUND_INT; 
             //printf("[rank %d]: dispatch round updated to 0x%x\n", rank, ll_dispatch_round_n);
         };
 
@@ -1303,7 +1303,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {
-        ll_combine_round_n += ll_combine_round_n == 0xffffffff ? 2 : 1; // do not hit zero
+        ll_combine_round_n = (ll_combine_round_n + 1) | COMBINE_ROUND_INT;
         //printf("[rank %d]: combine round updated to 0x%x\n", rank, ll_combine_round_n);
     }
 
@@ -1322,7 +1322,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     if (return_recv_hook)
         recv_hook = [=]() { 
             launcher(LOW_LATENCY_RECV_PHASE); 
-            ll_combine_round_n += ll_combine_round_n == 0xffffffff ? 2 : 1; // do not hit zero
+            ll_combine_round_n = (ll_combine_round_n + 1) | COMBINE_ROUND_INT;
             //printf("[rank %d]: combine round updated to 0x%x\n", rank, ll_combine_round_n);
         };
 
