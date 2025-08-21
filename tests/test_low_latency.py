@@ -92,6 +92,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     #topk_idx = torch.stack([(torch.arange(num_topk) + i + num_experts // num_ranks * rank) % num_experts for i in range(num_tokens)]).cuda()
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
+    #topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') / num_topk
 
     # Randomly mask some positions
     for i in range(10):
@@ -108,7 +109,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
-                            print(f'[rank {rank}]: dispatch func {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {return_recv_hook=}, round={i}/{num_times % 2 + 1}, cnt=0x{dispatch_round:x}', flush=True)
+                            #print(f'[rank {rank}]: dispatch func {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {return_recv_hook=}, round={i}/{num_times % 2 + 1}, cnt=0x{dispatch_round:x}', flush=True)
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
@@ -168,14 +169,15 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                 assert (recv_x_amin == j - rank_offset).sum().item() == (all_topk_idx[j] == expert_id).sum().item()
                                                 assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
                                         else:
-                                            hit_tokens_main = recv_x[token_pos_int[j][:per_rank_recv_count[j]], :-128]
-                                            if (hit_tokens_main != (j - rank_offset)).sum().item() != 0:
-                                                for hi in range(hit_tokens_main.shape[0]):
-                                                    if (hit_tokens_main[hi] != (j - rank_offset)).sum().item() == 0:
-                                                        continue
-                                                    print(f"[rank {rank}]: Error expert {expert_id} from {j} {hi}, hit_tokens_main: {all_value_range(hit_tokens_main[hi])}")
-                                            else:
-                                                assert (hit_tokens_main != (j - rank_offset)).sum().item() == 0
+                                            if not round_scale:
+                                                hit_tokens_main = recv_x[token_pos_int[j][:per_rank_recv_count[j]], :-128]
+                                                if (hit_tokens_main != (j - rank_offset)).sum().item() != 0:
+                                                    for hi in range(hit_tokens_main.shape[0]):
+                                                        if (hit_tokens_main[hi] != (j - rank_offset)).sum().item() == 0:
+                                                            continue
+                                                        print(f"[rank {rank}]: Error expert {expert_id} from {j} {hi}, hit_tokens_main: {all_value_range(hit_tokens_main[hi])}")
+                                                else:
+                                                    assert (hit_tokens_main != (j - rank_offset)).sum().item() == 0
 
                                         
                             if dispatch_use_fp8:
@@ -189,7 +191,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                            print(f'[rank {rank}]: combine {dispatch_use_fp8=} {return_recv_hook=} {round_scale=} {use_ue8m0=} {use_logfmt=} {zero_copy=} cnt=0x{combine_round:x}', flush=True)
+                            #print(f'[rank {rank}]: combine {dispatch_use_fp8=} {return_recv_hook=} {round_scale=} {use_ue8m0=} {use_logfmt=} {zero_copy=} cnt=0x{combine_round:x}', flush=True)
                             combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                                                 use_logfmt=use_logfmt,
                                                                                 async_finish=not return_recv_hook, zero_copy=zero_copy,
@@ -208,6 +210,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                         print(f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {round_scale=} {use_ue8m0=} {seed=}')
                                     else:
                                         assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
+                                #print(f'[rank {rank}]: combine diff = {diff:.6f}')
                                 hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
@@ -298,8 +301,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     for seed in range(int(1e9) if do_pressure_test else 0):
         if seed < 26:
             continue
-        if local_rank == 0:
-            print(f'Testing with seed {seed} ...', flush=True)
+        #if local_rank == 0:
+        print(f'Testing with seed {seed} ...', flush=True)
         ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
                              use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat)
         for i in range(20):

@@ -125,7 +125,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     const int __pages = PAGE_N(len);\
     for (int __pn = exec_id; __pn < __pages; __pn += exec_total) {\
         int *__check_ptr = reinterpret_cast<int*>(CHK_POSITION(send_buf, len, __pn, __pages));\
-        printf("[rank %d]: dispatch round 0x%08x token %d st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, token_idx, ZTAG(tagv), PTR_DIFF(__check_ptr, send_buf));\
+        /*printf("[rank %d]: dispatch round 0x%08x token %d st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, token_idx, ZTAG(tagv), PTR_DIFF(__check_ptr, send_buf))*/;\
         /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(__check_ptr) % sizeof(int) == 0)*/;\
         st_func(__check_ptr, ZTAG(tagv));\
     }\
@@ -135,7 +135,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     __syncwarp();\
     /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(dst_buf + len) % sizeof(int) == 0)*/;\
     lane_id == 0 ? st_release_sys_global(reinterpret_cast<int*>(dst_buf + len), ZTAG(tagv)) : void(0);\
-    if (lane_id == 0) printf("[rank %d]: dispatch round 0x%08x token %d st tail tag 0x%08x at offset %lu\n", rank, dispatch_round_n, token_idx, ZTAG(tagv), len);\
+    /*if (lane_id == 0) printf("[rank %d]: dispatch round 0x%08x token %d st tail tag 0x%08x at offset %lu\n", rank, dispatch_round_n, token_idx, ZTAG(tagv), len)*/;\
 }
 
 #define WAIT_BIT(recv_buf, len, ext_len, exec_id, exec_total, tagv, intra_node) {\
@@ -172,7 +172,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\
             if (ld_value == ZTAG(tagv)) {\
-                printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d get expected tag 0x%08x at offset: %lu\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, ld_value, reinterpret_cast<uint8_t*>(_check_ptr) - reinterpret_cast<uint8_t*>(recv_buf));\
+                /*printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d get expected tag 0x%08x at offset: %lu\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, ld_value, reinterpret_cast<uint8_t*>(_check_ptr) - reinterpret_cast<uint8_t*>(recv_buf))*/;\
                 break;\
             }\
             if (count_value == 0) {\
@@ -305,14 +305,14 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             if (__BASE_PN__ != __TAIL_PN__) {\
                 int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
                 tag_save[__BASE_PN__] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
-                printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + diff, tag_save[__BASE_PN__], __BASE_PN__);\
+                /*printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + diff, tag_save[__BASE_PN__], __BASE_PN__)*/;\
                 /*INT_VALUE_NO_NAN(tag_save[__BASE_PN__])*/;\
                 *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset) = ZTAG(tagv);\
             }\
             if (smsglen >= diff && smsglen < diff + bytes) {\
                 const auto jump_tag_offset = (smsglen & PCIE_SEG_LEN_MASK) - (diff & PCIE_SEG_LEN_MASK);\
                 tag_save[MAX_PAGES+1] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset);\
-                printf("[rank %d]: exp %d send back rank %d token %d, insert jump tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, jump_tag_offset + diff, tag_save[MAX_PAGES+1], MAX_PAGES+1);\
+                /*printf("[rank %d]: exp %d send back rank %d token %d, insert jump tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, jump_tag_offset + diff, tag_save[MAX_PAGES+1], MAX_PAGES+1)*/;\
                 *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset) = 0;\
             }\
         }\

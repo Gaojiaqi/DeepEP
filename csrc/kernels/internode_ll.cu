@@ -131,15 +131,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         if constexpr (kUseFP8) {\
             auto sfp = SHIFTED_ADDR_P(PTR, rdma_x_src_idx);\
             *sfp = VALUE;\
-            if (IS_PAGE_SUB_HEAD((PTR) + 1, rdma_x_src_idx, num_bytes_per_msg_v)) *reinterpret_cast<int*>(sfp + 1) = ZTAG(dispatch_round_n);\
+            /*if (IS_PAGE_SUB_HEAD((PTR) + 1, rdma_x_src_idx, num_bytes_per_msg_v)) *reinterpret_cast<int*>(sfp + 1) = ZTAG(dispatch_round_n)*/;\
         } else {\
             auto sfp = SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len);\
             *sfp = VALUE;\
             /*printf("[rank %d]: dispatch round 0x%08x st at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len), rdma_x_src_idx))*/;\
-            if ((PTR_DIFF(sfp + 1, rdma_x_src_idx) & PCIE_SEG_LEN_MASK) == (PCIE_SEG_LEN - PCIE_TAIL_SZ) || PTR_DIFF(PTR + 1, rdma_x_src_idx) == num_bytes_per_msg_v) {\
+            /*if ((PTR_DIFF(sfp + 1, rdma_x_src_idx) & PCIE_SEG_LEN_MASK) == (PCIE_SEG_LEN - PCIE_TAIL_SZ) || PTR_DIFF(PTR + 1, rdma_x_src_idx) == num_bytes_per_msg_v) {\
                 *reinterpret_cast<int*>(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1) = ZTAG(dispatch_round_n);\
-                /*printf("[rank %d]: dispatch round 0x%08x st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, ZTAG(dispatch_round_n), PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1, rdma_x_src_idx))*/;\
-            }\
+                printf("[rank %d]: dispatch round 0x%08x st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, ZTAG(dispatch_round_n), PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1, rdma_x_src_idx));\
+            }*/\
         }\
     } else {\
         NORMAL_ST(PTR, VALUE);\
@@ -190,13 +190,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     DISPATCH_ST(reinterpret_cast<int4*>(&rdma_x_vec[i]), int4_value);
                 }
             }
-            // if (kEager != EAGER_OFF) {
-            //     //const auto warp_runs = hidden_bf16_int4 / 32;
-            //     //const auto idle_warp_id = (warp_id + (num_warps - 1) - (warp_runs % (num_warps - 1))) % (num_warps - 1);
-            //     if (warp_id == 0) {
-            //         PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), dispatch_round_n, thread_id, num_threads, NORMAL_ST);
-            //     }
-            // }
+            if (kEager != EAGER_OFF) {
+                const auto warp_runs = hidden_bf16_int4 / 32;
+                const auto idle_warp_id = (warp_id + (num_warps - 1) - (warp_runs % (num_warps - 1))) % (num_warps - 1);
+                if (idle_warp_id == 0) {
+                    PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), dispatch_round_n, thread_id, num_threads, NORMAL_ST);
+                }
+            }
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
 
             // Issue IBGDA sends
@@ -221,11 +221,11 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-                    //WARP_SET_TAIL_TAG(dst_p2p_ptr, msg_distance - sizeof(int4), dispatch_round_n);
-                    if constexpr (kEager == EAGER_FULL) {
-                        __syncwarp();
-                        lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
-                    }
+                    WARP_SET_TAIL_TAG(dst_p2p_ptr, msg_distance - sizeof(int4), dispatch_round_n);
+                    // if constexpr (kEager == EAGER_FULL) {
+                    //     __syncwarp();
+                    //     lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+                    // }
                 }
 
                 // Increase counter after finishing
@@ -268,8 +268,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 expert_count[idx - expert_begin_idx] ++;
         }
         
-        int remain_nvl_cnt = 0;
-        uint64_t p2p_cnt_ptr[kNumMaxWarpGroups];
+        //int remain_nvl_cnt = 0;
+        //uint64_t p2p_cnt_ptr[kNumMaxWarpGroups];
         // Warp reduce
         #pragma unroll
         for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
@@ -287,16 +287,16 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     if (dst_p2p_ptr == 0) {
                         nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), num_tokens_sent, dst_rank, dst_expert_local_idx);
                     } else {
-                        atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
-                        if (ld_acquire_global(atomic_finish_counter_per_expert + i) % FINISHED_SUM_TAG == 0) {
-                            st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), num_tokens_sent);
-                            if (-(num_tokens_sent | 0xffff0000)-1 != 0) printf("[rank %d]: dispatch round 0x%08x %d tokens to expert %d\n", rank, dispatch_round_n, -(num_tokens_sent | 0xffff0000)-1, i);
-                            expert_count[i - expert_begin_idx] = 0;
-                        } else {
-                            remain_nvl_cnt += 1;
-                            p2p_cnt_ptr[i - expert_begin_idx] = dst_p2p_ptr;
-                            expert_count[i - expert_begin_idx] = num_tokens_sent;
-                        }
+                        // atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+                        // if (ld_acquire_global(atomic_finish_counter_per_expert + i) % FINISHED_SUM_TAG == 0) {
+                        st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), num_tokens_sent);
+                            //if (-(num_tokens_sent | 0xffff0000)-1 != 0) printf("[rank %d]: dispatch round 0x%08x %d tokens to expert %d\n", rank, dispatch_round_n, -(num_tokens_sent | 0xffff0000)-1, i);
+                        //     expert_count[i - expert_begin_idx] = 0;
+                        // } else {
+                        //     remain_nvl_cnt += 1;
+                        //     p2p_cnt_ptr[i - expert_begin_idx] = dst_p2p_ptr;
+                        //     expert_count[i - expert_begin_idx] = num_tokens_sent;
+                        // }
                     }
                     //printf("[rank %d]: round 0x%x %d tokens to expert %d at rank %d\n", rank, dispatch_round_n, sum, i, i / num_local_experts);
                 } else {
@@ -305,18 +305,18 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 }
             }
         }
-        if constexpr (kEager == EAGER_FULL) {
-            while (remain_nvl_cnt > 0) {
-                for (int i = expert_begin_idx; i < expert_end_idx; ++i) {
-                    if (expert_count[i - expert_begin_idx] == 0) continue;
-                    if (ld_acquire_global(atomic_finish_counter_per_expert + i) % FINISHED_SUM_TAG == 0) {
-                        st_release_sys_global(reinterpret_cast<int*>(p2p_cnt_ptr[i - expert_begin_idx]), expert_count[i - expert_begin_idx]);
-                        if (-(expert_count[i - expert_begin_idx] | 0xffff0000)-1 != 0) printf("[rank %d]: dispatch round 0x%08x %d tokens to expert %d\n", rank, dispatch_round_n, -(expert_count[i - expert_begin_idx] | 0xffff0000)-1, i);
-                        remain_nvl_cnt -= 1;
-                    }
-                }
-            }
-        }
+        // if constexpr (kEager == EAGER_FULL) {
+        //     while (remain_nvl_cnt > 0) {
+        //         for (int i = expert_begin_idx; i < expert_end_idx; ++i) {
+        //             if (expert_count[i - expert_begin_idx] == 0) continue;
+        //             if (ld_acquire_global(atomic_finish_counter_per_expert + i) % FINISHED_SUM_TAG == 0) {
+        //                 st_release_sys_global(reinterpret_cast<int*>(p2p_cnt_ptr[i - expert_begin_idx]), expert_count[i - expert_begin_idx]);
+        //                 //if (-(expert_count[i - expert_begin_idx] | 0xffff0000)-1 != 0) printf("[rank %d]: dispatch round 0x%08x %d tokens to expert %d\n", rank, dispatch_round_n, -(expert_count[i - expert_begin_idx] | 0xffff0000)-1, i);
+        //                 remain_nvl_cnt -= 1;
+        //             }
+        //         }
+        //     }
+        // }
         // if constexpr (kEager == EAGER_FULL) { // flush all p2p write out
         //     if (lane_id == 0 && atomicAdd(atomic_finish_counter_per_expert + 1, 1) % num_sms == (num_sms - 1)) {
         //         __threadfence_system();
@@ -324,7 +324,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         //     }
         // }
     }
-    if (kEager != EAGER_FULL) {
+    if constexpr (kEager != EAGER_FULL) {
         
         __syncthreads();
         // Issue count sends
@@ -395,31 +395,31 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         // NOTES: using sub-warp 1 to overlap with sub-warp 0
         int num_recv_tokens = 0, recv_token_begin_idx;
         auto rcv_cnt_ptr = rdma_recv_count + local_expert_idx * num_ranks + src_rank;
-        const auto normal_recv = kEager != EAGER_FULL || ld_intra_node;
+        //const auto normal_recv = kEager != EAGER_FULL || ld_intra_node;
         
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 15);
-        if (normal_recv) {
+        if constexpr (kEager != EAGER_FULL) {
             if (sub_warp_id == 1 and lane_id == 0) {
                 auto start_time = clock64();
-                if constexpr (kEager != EAGER_FULL) {
+                //if constexpr (kEager != EAGER_FULL) {
                     while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) == 0);
-                } else {
-                    while (((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) & 0xffff0000) != SHORT_TAG(dispatch_round_n));
-                }
+                // } else {
+                //     while (((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) & 0xffff0000) != SHORT_TAG(dispatch_round_n));
+                // }
                 auto wait_recv_cost = clock64() - start_time;
-                if constexpr (kEager == EAGER_FULL) {
-                    num_recv_tokens = num_recv_tokens | 0xffff0000;
-                }
+                // if constexpr (kEager == EAGER_FULL) {
+                //     num_recv_tokens = num_recv_tokens | 0xffff0000;
+                // }
                 num_recv_tokens = -num_recv_tokens - 1;
-                if (num_recv_tokens != 0) printf("[rank %d]: dispatch round 0x%08x expert %d from rank %d got %d tokens\n", rank, dispatch_round_n, global_expert_idx, src_rank, num_recv_tokens);
+                //if (num_recv_tokens != 0) printf("[rank %d]: dispatch round 0x%08x expert %d from rank %d got %d tokens\n", rank, dispatch_round_n, global_expert_idx, src_rank, num_recv_tokens);
                 recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
                 shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
                 shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
-                if (kEager != EAGER_FULL) {
+                //if (kEager != EAGER_FULL) {
                     recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
-                } else {
-                    atomicAdd(per_rank_recv_cnt_ptr + src_rank, num_recv_tokens);
-                }
+                // } else {
+                //     atomicAdd(per_rank_recv_cnt_ptr + src_rank, num_recv_tokens);
+                // }
                 // Add stats for diagnosis
                 if (cumulative_local_expert_recv_stats != nullptr)
                     atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx, num_recv_tokens);
@@ -433,12 +433,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
         int this_token_index_in_recv = 0;
-        for (int i = sub_warp_id; (normal_recv && i < num_recv_tokens) || (!normal_recv && (num_recv_tokens == 0 || i < -num_recv_tokens-1) && i < num_max_dispatch_tokens_per_rank); i += num_warps_per_group) {
+        for (int i = sub_warp_id; (kEager != EAGER_FULL && i < num_recv_tokens) || (kEager == EAGER_FULL && (num_recv_tokens == 0 || i < -num_recv_tokens-1) && i < num_max_dispatch_tokens_per_rank); i += num_warps_per_group) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * msg_distance);
             
             if (kEager == EAGER_FULL) {
-                if (!ld_intra_node) {
+                //if (!ld_intra_node) {
                     WAIT_2BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node);
                     __syncwarp();
                     num_recv_tokens = warp_reduce_min(num_recv_tokens);
@@ -447,7 +447,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                         //if (sub_warp_id == 0 && lane_id == 0 && (-num_recv_tokens-1) != 0) printf("[rank %d]: dispatch recv token expert %d get %d tokens from rank %d, done\n", rank, global_expert_idx, (-num_recv_tokens-1), src_rank);
                         break;
                     }
-                }
+                //}
                 
                 // int offsets[4] = {4080, 8176, 12272, 14416};
                 // char tmatch[2][30] = {"", " WRONG DISPATCH TAG!"};
@@ -457,7 +457,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 //     printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d inter node tag 0x%08x at offset: %d %s\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, mtag, offsets[lane_id], mtag_str);
                 // }
                 // __syncwarp();
-                if (!ld_intra_node) {
+                //if (!ld_intra_node) {
                     if (lane_id == 0) {
                         this_token_index_in_recv = atomic_add_release_global(packed_recv_count + local_expert_idx, 1);
                         atomicAdd(per_rank_recv_cnt_ptr + src_rank, 1);
@@ -466,12 +466,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     }
                     __syncwarp();
                     this_token_index_in_recv = __shfl_sync(0xffffffff, this_token_index_in_recv, 0);
-                } else {
-                    this_token_index_in_recv = recv_token_begin_idx + i;
-                    if (lane_id == 0) {
-                        token_src_bitmap[i] = this_token_index_in_recv;
-                    }
-                }
+                // } else {
+                //     this_token_index_in_recv = recv_token_begin_idx + i;
+                //     if (lane_id == 0) {
+                //         token_src_bitmap[i] = this_token_index_in_recv;
+                //     }
+                // }
             } else if constexpr (kEager != EAGER_OFF) {
                 WAIT_BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, ld_intra_node);
                 __syncwarp();
@@ -804,9 +804,9 @@ combine(void* combined_x,
     constexpr size_t combine_msg_max = num_scales * sizeof(nv_bfloat162) + kHidden * sizeof(nv_bfloat16);
     constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int4), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_slot_v;
 
-    if (sm_id == 0 && thread_id == 0) {
-        printf("[rank %d]: target tag = 0x%x short tag = 0x%08x, msg_distance = %lu, num_bytes_per_slot = %lu\n", rank, ZTAG(combine_round_n), SHORT_TAG(combine_round_n), msg_distance, num_bytes_per_slot);
-    }
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("[rank %d]: target tag = 0x%x short tag = 0x%08x, msg_distance = %lu, num_bytes_per_slot = %lu\n", rank, ZTAG(combine_round_n), SHORT_TAG(combine_round_n), msg_distance, num_bytes_per_slot);
+    // }
 
     constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag jump position
     constexpr size_t short_msg_ext_len = SHIFTED_ADDR(short_msg_len);
@@ -1355,7 +1355,7 @@ combine(void* combined_x,
     if (responsible_expert_idx < num_experts) {
         //const auto src_rank = responsible_expert_idx / num_local_experts;
         //const auto intra_node = (src_rank >> 3) == (rank >> 3);
-        if (kEager_combine == EAGER_FULL) {
+        if constexpr (kEager_combine == EAGER_FULL) {
             EP_DEVICE_ASSERT(num_warps_per_group > 1);
             if (sub_warp_id == 0 and lane_id == 0) {
                 const auto target_value = (SHORT_TAG(combine_round_n) | 1);
