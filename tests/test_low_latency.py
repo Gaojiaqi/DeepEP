@@ -67,7 +67,7 @@ dispatch_round = 0x40000000
 combine_round = 0xc0000000
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: deep_ep.Buffer,
-              use_logfmt: bool = False, seed: int = 0, eager_opt: int = 1, repeat: int = 1):
+              use_logfmt: bool = False, seed: int = 0, eager_opt: int = 1, repeat: int = 1, trace_pfx : str = None):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
 
@@ -250,7 +250,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_dispatch_comm_bytes += num_fp8_bytes * num_selections
         num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
 
-    for _ in range(repeat):
+    for ri in range(repeat):
         # Dispatch + combine testing
         avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
         print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
@@ -259,10 +259,11 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         # Separate profiling
         #continue
         for return_recv_hook in (False, True):
+            trace_name = f'{trace_pfx}_{return_recv_hook}_{rank}.json' if trace_pfx is not None and ri == 0 else None
             group.barrier()
             dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=return_recv_hook),
                                                 kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                                suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, trace_path=f'b_trace_{return_recv_hook}_{rank}.json')
+                                                suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, trace_path=trace_name)
             if not return_recv_hook:
                 print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                     f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
@@ -280,6 +281,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     eager_opt = args.eager
     eager_support = eager_opt != deep_ep.Buffer.EAGER_OFF
     repeat = args.repeat
+    trace_pfx = args.chrome_trace_pfx
 
     use_sep_stdout = args.sep_out_pfx is not None
     if use_sep_stdout:
@@ -301,17 +303,17 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             allow_nvlink_for_low_latency_mode=not args.disable_nvlink, explicitly_destroy=True,
                             allow_mnnvl=args.allow_mnnvl, eager_support=eager_support)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
-              use_logfmt=args.use_logfmt, seed=1, eager_opt=eager_opt, repeat=repeat)
+              use_logfmt=args.use_logfmt, seed=1, eager_opt=eager_opt, repeat=repeat, trace_pfx=trace_pfx)
 
     do_pressure_test = args.pressure_test
     for seed in range(int(1e9) if do_pressure_test else 0):
         #if local_rank == 0:
         print(f'Testing with seed {seed} ...', flush=True)
         ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
-                             use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat)
+                             use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, trace_pfx=trace_pfx)
         for i in range(20):
             if test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
-                             use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat) != ref_hash: 
+                             use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, trace_pfx=trace_pfx) != ref_hash: 
                 print(f'[rank {rank}]: Error: seed={seed}')
 
     # Destroy the buffer runtime and communication group
@@ -353,6 +355,8 @@ if __name__ == '__main__':
                         help="performance test repeat times (default: 1)")
     parser.add_argument("--sep-out-pfx", type=str, default=None,
                         help="split output file prefix for each rank, stored as <prefix>_<rank>.txt, default: None, means mixed stdout")
+    parser.add_argument("--chrome-trace-pfx", type=str, default=None,
+                        help="store kineto trace if this prefix is given, stored as <prefix>_<return_hook>_<rank>.json")
     args = parser.parse_args()
 
     num_processes = args.num_processes
