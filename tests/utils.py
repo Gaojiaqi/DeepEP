@@ -186,6 +186,7 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
     # Save chrome traces
     if trace_path is not None:
         prof.export_chrome_trace(trace_path)
+        profile_data = json.loads(Path(trace_path).read_text())
 
     # Return average kernel durations
     units = {'ms': 1e3, 'us': 1e6}
@@ -202,9 +203,10 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
 
     # Expand the kernels by periods
     if num_kernels_per_period > 1:
-        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
-            prof.export_chrome_trace(tmp.name)
-            profile_data = json.loads(Path(tmp.name).read_text())
+        if trace_path is None:
+            with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+                prof.export_chrome_trace(tmp.name)
+                profile_data = json.loads(Path(tmp.name).read_text())
 
         for i, kernel_name in enumerate(kernel_names):
             events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
