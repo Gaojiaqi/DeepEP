@@ -34,13 +34,14 @@ class Buffer:
     EAGER_OFF = 1
     EAGER_CHK = 2
     EAGER_FULL = 3
-    def __init__(self, group: dist.ProcessGroup,
+    def __init__(self, group: Optional[dist.ProcessGroup],
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
                  low_latency_mode: bool = False, num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
                  explicitly_destroy: bool = False,
-                 eager_support: bool = False) -> None:
+                 eager_support: bool = False,
+                 comm: Optional["mpi4py.MPI.Comm"] = None) -> None:
         """
         Initialize the communication buffer.
 
@@ -59,13 +60,27 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
+            comm: the mpi4py.MPI.Comm communicator to use in case the group parameter is absent.
         """
         check_nvlink_connections(group)
 
         # Initialize the CPP runtime
-        self.rank = group.rank()
-        self.group_size = group.size()
-        self.group = group
+        if group is not None:
+            self.rank = group.rank()
+            self.group_size = group.size()
+
+            def all_gather_object(obj):
+                object_list = [None] * self.group_size
+                dist.all_gather_object(object_list, obj, group)
+                return object_list
+        elif comm is not None:
+            self.rank = comm.Get_rank()
+            self.group_size = comm.Get_size()
+
+            def all_gather_object(obj):
+                return comm.allgather(obj)
+        else:
+            raise ValueError("Either 'group' or 'comm' must be provided.")
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -74,19 +89,17 @@ class Buffer:
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy, eager_support)
 
         # Synchronize device IDs
-        device_ids = [None, ] * self.group_size
         local_device_id = self.runtime.get_local_device_id()
-        dist.all_gather_object(device_ids, local_device_id, group)
+        device_ids = all_gather_object(local_device_id)
 
         # Synchronize IPC handles
-        ipc_handles = [None, ] * self.group_size
         local_ipc_handle = self.runtime.get_local_ipc_handle()
-        dist.all_gather_object(ipc_handles, local_ipc_handle, group)
+        ipc_handles = all_gather_object(local_ipc_handle)
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            # Enable IBGDA 
+            # Enable IBGDA
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
@@ -110,10 +123,9 @@ class Buffer:
                 os.environ['NVSHMEM_IB_ENABLE_RELAXED_ORDERING'] = '0' # // Disable relaxed ordering to support eager recv
 
             # Synchronize using the root ID
-            nvshmem_unique_ids = [None, ] * self.group_size
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
-            dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
+            nvshmem_unique_ids = all_gather_object(root_unique_id)
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
         # Make CPP runtime available
@@ -123,7 +135,7 @@ class Buffer:
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
-        
+
         """
 
         assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
@@ -179,7 +191,7 @@ class Buffer:
         Get the communication stream.
 
         Returns:
-            stream: the communication stream. 
+            stream: the communication stream.
         """
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)

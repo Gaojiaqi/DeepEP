@@ -757,7 +757,7 @@ __forceinline__ __device__ void logfmt_check_amaxmin(uint8_t* meta_buffer, float
         const auto& bf162_amaxmin = reinterpret_cast<__nv_bfloat162*>(&amaxmin2);
         float log_amax[2], log_amin[2];
         #pragma unroll
-        for (int i = 0; i < 2; ++ i) { 
+        for (int i = 0; i < 2; ++ i) {
             auto amax = static_cast<float>(bf162_amaxmin[i].x);
             auto amin = static_cast<float>(bf162_amaxmin[i].y);
             log_amax[i] = log2f_approx(amax);
@@ -1492,7 +1492,7 @@ void combine(void* combined_x,
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
-    EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and num_recv_per_sm > 0);
+    EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and ((num_combined_tokens == 0) or (num_recv_per_sm > 0)));
 
     const auto num_warps = num_warp_groups * num_warps_per_group;
     const auto num_sms = max(ceil_div(num_experts, num_warp_groups), ceil_div(num_combined_tokens, num_recv_per_sm));

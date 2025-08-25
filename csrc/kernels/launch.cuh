@@ -65,6 +65,8 @@ cfg.dynamicSmemBytes = smem_size;
         case 4: case_macro(4); \
         case 8: case_macro(8); \
         case 16: case_macro(16); \
+        case 18: case_macro(18); \
+        case 20: case_macro(20); \
         default: EP_HOST_ASSERT(false and "Unsupported RDMA ranks"); \
     } while (false)
 
