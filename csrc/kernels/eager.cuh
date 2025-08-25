@@ -108,9 +108,13 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
  * Phase 3: auto tagging
  */
 
+// x < 1048576 approximation
+#define DIV255(x) (((x) * 0x8081U) >> 23)
+
 #define SHIFTED_ADDR(a) (a + ((a) / (PCIE_SEG_LEN - PCIE_TAIL_SZ)) * PCIE_TAIL_SZ)
 #define PTR_DIFF(a, b) (reinterpret_cast<uint8_t*>(a) - reinterpret_cast<uint8_t*>(b))
-#define SHIFTED_ADDR_P(ptr, bptr) (ptr + ((PTR_DIFF(ptr, bptr) / (PCIE_SEG_LEN - PCIE_TAIL_SZ))) * PCIE_TAIL_SZ / sizeof(*(ptr)))
+//#define SHIFTED_ADDR_P(ptr, bptr) (ptr + ((PTR_DIFF(ptr, bptr) / (PCIE_SEG_LEN - PCIE_TAIL_SZ))) * PCIE_TAIL_SZ / sizeof(*(ptr)))
+#define SHIFTED_ADDR_P(ptr, bptr) (ptr + DIV255(PTR_DIFF(ptr, bptr) >> 4) * PCIE_TAIL_SZ / sizeof(*(ptr)))
 #define SHIFTED_ADDR_PS(ptr, bptr, smsglen) SHIFTED_ADDR_P(ptr + (PTR_DIFF(ptr, bptr) >= smsglen ? (sizeof(int4) / sizeof(*(ptr))) : 0), bptr)
 #define IS_PAGE_SUB_HEAD(ptr, bptr, size) (((PTR_DIFF(ptr, bptr) == (size)) || (PTR_DIFF(ptr, bptr) % (PCIE_SEG_LEN - PCIE_TAIL_SZ)) == 0))
 #define CHK_POSITION(bptr, size, pn, ptotal) (reinterpret_cast<uint8_t*>(bptr) + ((pn == ptotal - 1) ? SHIFTED_ADDR(size) : (((pn) << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ))))
@@ -300,28 +304,25 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 
 
 #define TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, gmem_base, tag_save, smsglen, tagv, kparam) {\
-    if constexpr (kparam != EAGER_OFF) {\
-        if (true) {\
-            /*printf("[rank %d]: debug: modifying smem\n", rank)*/;\
-            const auto diff = PTR_DIFF(gmem_ptr, gmem_base);\
-            int __BASE_PN__ = diff >> PCIE_SEG_LEN_LOG;\
-            int __TAIL_PN__ = (diff + bytes) >> PCIE_SEG_LEN_LOG;\
-            if (__BASE_PN__ != __TAIL_PN__) {\
-                int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
-                tag_save[__BASE_PN__] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
-                /*printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + diff, tag_save[__BASE_PN__], __BASE_PN__)*/;\
-                /*INT_VALUE_NO_NAN(tag_save[__BASE_PN__])*/;\
-                st_release_cta(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset), ZTAG(tagv));\
-            }\
-            if (smsglen >= diff && smsglen < diff + bytes) {\
-                const auto jump_tag_offset = (smsglen & PCIE_SEG_LEN_MASK) - (diff & PCIE_SEG_LEN_MASK);\
-                tag_save[MAX_PAGES+1] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset);\
-                /*printf("[rank %d]: exp %d send back rank %d token %d, insert jump tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, jump_tag_offset + diff, tag_save[MAX_PAGES+1], MAX_PAGES+1)*/;\
-                st_release_cta(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset), 0);\
-            }\
-        }\
+    /*printf("[rank %d]: debug: modifying smem\n", rank)*/;\
+    const auto diff = PTR_DIFF(gmem_ptr, gmem_base);\
+    int __BASE_PN__ = diff >> PCIE_SEG_LEN_LOG;\
+    int __TAIL_PN__ = (diff + bytes) >> PCIE_SEG_LEN_LOG;\
+    if (lane_id == 0 && __BASE_PN__ != __TAIL_PN__) {\
+        int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
+        tag_save[__BASE_PN__] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
+        /*printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + diff, tag_save[__BASE_PN__], __BASE_PN__)*/;\
+        /*INT_VALUE_NO_NAN(tag_save[__BASE_PN__])*/;\
+        st_release_cta(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset), ZTAG(tagv));\
     }\
-    tma_func(smem_ptr, gmem_ptr, bytes);\
+    if (lane_id == 1 && smsglen >= diff && smsglen < diff + bytes) {\
+        const auto jump_tag_offset = (smsglen & PCIE_SEG_LEN_MASK) - (diff & PCIE_SEG_LEN_MASK);\
+        tag_save[MAX_PAGES+1] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset);\
+        /*printf("[rank %d]: exp %d send back rank %d token %d, insert jump tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, jump_tag_offset + diff, tag_save[MAX_PAGES+1], MAX_PAGES+1)*/;\
+        st_release_cta(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + jump_tag_offset), 0);\
+    }\
+    __syncwarp();\
+    if (lane_id == 0) tma_func(smem_ptr, gmem_ptr, bytes);\
 }
 
 #endif // __CUDACC__

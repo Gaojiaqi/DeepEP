@@ -125,29 +125,47 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             //if (thread_id == 0) printf("[rank %d]: dispatch round 0x%08x copying token %d\n", rank, dispatch_round_n, token_idx);
+            constexpr size_t scale_st_offset = sizeof(int4) * (kHidden == 8192 ? 2 : (kHidden < 4096 ? 0 : 1));
+            constexpr size_t scale_st_float_offset = kEager != EAGER_OFF ? (scale_st_offset / sizeof(float)) : 0;
+            constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
+            constexpr size_t page_int2 = page_int4 << 1;
+            constexpr size_t short_msg_int4 = short_msg_len / sizeof(int4);
+            const size_t data_st_int4_offset = 
+            kEager != EAGER_OFF ? 
+                (kHidden == 8192 ?  
+                    ((thread_id + 1) < page_int4 ? 0 : (thread_id + 1) < 2 * page_int4 ? 1 : (thread_id + 1) < short_msg_int4 ? 2 : (thread_id + 2) < 3 * page_int4 ? 3 : 4) :
+                    (kHidden >= 4096 ? 
+                        ((thread_id + 1) < page_int4 ? 0 : (thread_id + 1) < short_msg_int4 ? 1 : (thread_id + 2) < 2 * page_int4 ? 2 : (thread_id + 2) < 3 * page_int4 ? 3 : 4) : 
+                        ((thread_id + 1) < short_msg_int4 ? 0 : (thread_id + 1) < page_int4 ? 1 : (thread_id + 2) < 2 * page_int4 ? 2 : (thread_id + 2) < 3 * page_int4 ? 3 : 4)))
+                : 0;
+            const size_t data_st_int2_offset = kEager != EAGER_OFF ? ((thread_id + 2) < page_int2 ? 0 : (thread_id + 2) < 2 * page_int2 ? 2 : 4) : 0;
+            
+            //const size_t int4_pos = thread_id + 1 + ((thread_id + 1) >= short_msg_int4 ? 1 : 0);
+            //const size_t data_st_int4_offset = int4_pos < page_int4 ? 0 : (int4_pos < 2 * page_int4 ? 1 : (int4_pos < 3 * page_int4 ? 2 : 3));
 #define DISPATCH_LD(ld_func, ptr) ((kEager != EAGER_OFF) ? LD_SHIFTED(ld_func, ptr, src_src_idx) : ld_func(ptr))
-#define DISPATCH_ST(PTR, VALUE) {\
-    if constexpr (kEager != EAGER_OFF) {\
-        if constexpr (kUseFP8) {\
-            auto sfp = SHIFTED_ADDR_P(PTR, rdma_x_src_idx);\
-            *sfp = VALUE;\
-            /*if (IS_PAGE_SUB_HEAD((PTR) + 1, rdma_x_src_idx, num_bytes_per_msg_v)) *reinterpret_cast<int*>(sfp + 1) = ZTAG(dispatch_round_n)*/;\
-        } else {\
-            auto sfp = SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len);\
-            *sfp = VALUE;\
-            /*printf("[rank %d]: dispatch round 0x%08x st at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len), rdma_x_src_idx))*/;\
-            /*if ((PTR_DIFF(sfp + 1, rdma_x_src_idx) & PCIE_SEG_LEN_MASK) == (PCIE_SEG_LEN - PCIE_TAIL_SZ) || PTR_DIFF(PTR + 1, rdma_x_src_idx) == num_bytes_per_msg_v) {\
-                *reinterpret_cast<int*>(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1) = ZTAG(dispatch_round_n);\
-                printf("[rank %d]: dispatch round 0x%08x st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, ZTAG(dispatch_round_n), PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1, rdma_x_src_idx));\
-            }*/\
-        }\
-    } else {\
-        NORMAL_ST(PTR, VALUE);\
-    }\
-}
+// #define DISPATCH_ST(PTR, VALUE) {\
+//     if constexpr (kEager != EAGER_OFF) {\
+//         if constexpr (kUseFP8) {\
+//             auto sfp = SHIFTED_ADDR_P(PTR, rdma_x_src_idx);\
+//             *sfp = VALUE;\
+//             /*if (IS_PAGE_SUB_HEAD((PTR) + 1, rdma_x_src_idx, num_bytes_per_msg_v)) *reinterpret_cast<int*>(sfp + 1) = ZTAG(dispatch_round_n)*/;\
+//         } else {\
+//             auto sfp = SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len);\
+//             *sfp = VALUE;\
+//             /*printf("[rank %d]: dispatch round 0x%08x st at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len), rdma_x_src_idx))*/;\
+//             /*if ((PTR_DIFF(sfp + 1, rdma_x_src_idx) & PCIE_SEG_LEN_MASK) == (PCIE_SEG_LEN - PCIE_TAIL_SZ) || PTR_DIFF(PTR + 1, rdma_x_src_idx) == num_bytes_per_msg_v) {\
+//                 *reinterpret_cast<int*>(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1) = ZTAG(dispatch_round_n);\
+//                 printf("[rank %d]: dispatch round 0x%08x st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, ZTAG(dispatch_round_n), PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1, rdma_x_src_idx));\
+//             }*/\
+//         }\
+//     } else {\
+//         NORMAL_ST(PTR, VALUE);\
+//     }\
+// }
 
             if (thread_id == 0) {
-                DISPATCH_ST(rdma_x_src_idx, token_idx);
+                //DISPATCH_ST(rdma_x_src_idx, token_idx);
+                *rdma_x_src_idx = token_idx; // first element never shift...
             }
 
             // FP8 cast
@@ -173,7 +191,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     amax = warp_reduce_max<16>(amax);
                     calculate_fp8_scales(amax, scale, scale_inv, round_scale);
                     if (lane_id == 0 or lane_id == 16) {
-                        DISPATCH_ST(&rdma_x_scales[i * kNumElemsPerRead / 128], scale_inv);
+                        //DISPATCH_ST(&rdma_x_scales[i * kNumElemsPerRead / 128], scale_inv);
+                        rdma_x_scales[i * kNumElemsPerRead / 128 + scale_st_float_offset] = scale_inv;
                     }
 
                     // Cast into send buffer
@@ -184,10 +203,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                         float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
                     }
-                    DISPATCH_ST(&rdma_x_vec[i], int2_value);
+                    //DISPATCH_ST(&rdma_x_vec[i], int2_value);
+                    rdma_x_vec[i + data_st_int2_offset] = int2_value;
                 } else {
                     // Reinterpret-cast is for C++14 compatibility
-                    DISPATCH_ST(reinterpret_cast<int4*>(&rdma_x_vec[i]), int4_value);
+                    //DISPATCH_ST(reinterpret_cast<int4*>(&rdma_x_vec[i]), int4_value);
+                    reinterpret_cast<int4*>(rdma_x_vec)[i + data_st_int4_offset] = int4_value;
                 }
             }
             if constexpr (kEager != EAGER_OFF) {
@@ -508,7 +529,22 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + this_token_index_in_recv * hidden_int4;
             if constexpr (kEager != EAGER_OFF) {
-                UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);  
+                UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);
+                // constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
+                // if constexpr (kUseFP8) {
+                //     size_t copy_done = 0;
+                //     size_t offset = 0;
+                //     while (copy_done < hidden_int4) {
+                //         size_t to_copy = min(page_int4 - (offset == 0 ? 1 : 0), hidden_int4 - copy_done);
+                //         auto src_data_ = src_data + copy_done + offset;
+                //         auto dst_data_ = dst_data + copy_done;
+                //         UNROLLED_WARP_COPY(7, lane_id, to_copy, dst_data_, src_data_, ld_nc_global, st_na_release);
+                //         offset += 1;
+                //         copy_done += to_copy;
+                //     }
+                // } else {
+                //     UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);
+                // }
             } else {
                 UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
             }
@@ -992,11 +1028,20 @@ combine(void* combined_x,
                     } else {
                         // BF16 original values
 #define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, short_msg_ext_len, combine_round_n, kEager_combine)
-                        if ((kEager_combine != EAGER_OFF) ? (lane_id == 0) : elect_one_sync(lane_id)) { // force lane 0 to issue tma
+                        if constexpr (kEager_combine == EAGER_OFF) {
+                            if (elect_one_sync(lane_id)) {
+                                auto w_offset_int4 = iter_idx * kNumSendUnrolls * 32; // i is dynamic...
+                                tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + w_offset_int4, get_num_tma_bytes(w_offset_int4));
+                            }
+                        } else {
                             auto w_offset_int4 = iter_idx * kNumSendUnrolls * 32; // i is dynamic...
                             COMBINE_SEND_TMA(tma_store_1d, tma_buffers[stage_idx], cpy_dst_int4_ptr + w_offset_int4, get_num_tma_bytes(w_offset_int4));
-                            //tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + w_offset_int4, get_num_tma_bytes(w_offset_int4));
                         }
+                        // if ((kEager_combine != EAGER_OFF) ? (lane_id == 0) : elect_one_sync(lane_id)) { // force lane 0 to issue tma
+                        //     auto w_offset_int4 = iter_idx * kNumSendUnrolls * 32; // i is dynamic...
+                        //     COMBINE_SEND_TMA(tma_store_1d, tma_buffers[stage_idx], cpy_dst_int4_ptr + w_offset_int4, get_num_tma_bytes(w_offset_int4));
+                        //     //tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + w_offset_int4, get_num_tma_bytes(w_offset_int4));
+                        // }
                     }
                     __syncwarp();
                 }
@@ -1015,10 +1060,11 @@ combine(void* combined_x,
                         // reduce or because tags may be stored in different lanes, maybe there is a better way, why just use lane 0 to do tma? If so, reduce can be replaced by shfl_sync
                         __syncwarp();
                         #pragma unroll
-                        for (int __pn = 0; __pn <= MAX_PAGES + 1; ++__pn) {
+                        for (int __pn = 0; __pn < MAX_PAGES; ++__pn) {
                             //__tail_tags[__pn] = warp_reduce_or(__tail_tags[__pn]);
                             __tail_tags[__pn] = __shfl_sync(0xffffffff, __tail_tags[__pn], 0);
                         }
+                        __tail_tags[MAX_PAGES + 1] = __shfl_sync(0xffffffff, __tail_tags[MAX_PAGES + 1], 1);
 
                         //EP_DEVICE_ASSERT(lane_id == get_lane_id());
                         EP_STATIC_ASSERT((kHidden * sizeof(nv_bfloat16)) % sizeof(int4) == 0, "combine message len (no logfmt) shall be a multiple of int4");
@@ -1034,7 +1080,9 @@ combine(void* combined_x,
                             //     INT_VALUE_NO_NAN(__tail_tags_int4[lane_id].w);
                             // }
                             //st_na_release(target_ptr, __tail_tags_int4[lane_id]);
-                            dst_p2p_ptr == 0 ? st_release_cta(target_ptr, __tail_tags_int4[lane_id]) : st_release_sys_global(target_ptr, __tail_tags_int4[lane_id]);
+                            //dst_p2p_ptr == 0 ? st_release_cta(target_ptr, __tail_tags_int4[lane_id]) : st_release_sys_global(target_ptr, __tail_tags_int4[lane_id]);
+                            //st_release_cta(target_ptr, __tail_tags_int4[lane_id]);
+                            *target_ptr = __tail_tags_int4[lane_id]; // TODO: validate whether there is any memory order problem...
                             // if ((*target_ptr).y != __tail_tags_int4[lane_id].y) {
                             //     printf("[rank %d]: exp %d send back rank %d token %d, put %d stored value and last tag, {0x%08x, 0x%08x, 0x%08x, 0x%08x} offset %lu, but check mismatch\n", rank, global_expert_idx, dst_rank, src_idx, lane_id, __tail_tags_int4[lane_id].x, __tail_tags_int4[lane_id].y, __tail_tags_int4[lane_id].z, __tail_tags_int4[lane_id].w, (target_ptr - cpy_dst_int4_ptr) * sizeof(int4));
                             // }
