@@ -255,13 +255,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 if constexpr (kEager != EAGER_FULL) {
                     lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
                 } 
-                // else {
-                //     if (lane_id == 0) {
-                //         if (((atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) + 1) & (FINISHED_SUM_TAG - 1)) == 0) {
-                //             atomic_counter_per_expert[dst_expert_idx] = 0;
-                //         }
-                //     }
-                // }
+                else {
+                    if (lane_id == 0) {
+                        auto cur_v = atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) + 1;
+                        if (((cur_v) & (FINISHED_SUM_TAG - 1)) == 0) {
+                            //printf("[rank %d]: dispatch round 0x%08x expert %d atom cnt %d\n", rank, dispatch_round_n, dst_expert_idx, cur_v);
+                            atomic_counter_per_expert[dst_expert_idx] = 0;
+                        }
+                    }
+                }
             }
         }
     } else if (warp_id == num_warps - 1) {
@@ -328,9 +330,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                         // }
                     }
                     //printf("[rank %d]: round 0x%x %d tokens to expert %d at rank %d\n", rank, dispatch_round_n, sum, i, i / num_local_experts);
-                    // if (((atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum) + FINISHED_SUM_TAG - sum) & (FINISHED_SUM_TAG - 1)) ==  (FINISHED_SUM_TAG - 1)) {
-                    //     atomic_counter_per_expert[i] = 0;
-                    // }
+                    auto cur_v = atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum) + FINISHED_SUM_TAG - sum;
+                    
+                    if ((cur_v & (FINISHED_SUM_TAG - 1)) == 0) {
+                        //printf("[rank %d]: dispatch round 0x%08x expert %d atom cnt %d\n", rank, dispatch_round_n, i, cur_v);
+                        atomic_counter_per_expert[i] = 0;
+                    }
                 } else {
                     shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
                     atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
@@ -421,6 +426,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto num_aligned_scales = align<int>(num_scales, sizeof(float) / sizeof(scale_t));
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
 
+        auto recv_cnt_barrier = atomic_finish_counter_per_expert + num_experts + local_expert_idx;
+
         // Shared between sub-warps in warp groups
         __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups], shared_recv_token_begin_idx[kNumMaxWarpGroups];
 
@@ -463,11 +470,18 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             num_recv_tokens = shared_num_recv_tokens[warp_group_id];
             recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
         } else {
-            // if (sub_warp_id == 1 && lane_id == 0) {
-            //     //st_release_cta(packed_recv_count + local_expert_idx, 0);
-            //     st_release_cta(per_rank_recv_cnt_ptr, 0);
-            // }
-            // asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(num_warps_per_group * 32));
+            if (sub_warp_id == 1 && lane_id == 0) {
+                //st_release_cta(packed_recv_count + local_expert_idx, 0);
+                int cur_v = atomic_add_release_global(recv_cnt_barrier, 1);
+                st_release_cta(per_rank_recv_cnt_ptr, 0);
+                if (cur_v != num_ranks - 1) {
+                    while (ld_nc_global(recv_cnt_barrier) != 0);
+                } else {
+                    st_na_global(packed_recv_count + local_expert_idx, 0);
+                    st_na_global(recv_cnt_barrier, 0);
+                }
+            }
+            asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(num_warps_per_group * 32));
         }
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
@@ -607,10 +621,11 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     auto atomic_counter_per_expert = static_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+    //
     if ((eager_opt == EAGER_FULL) && (phases & LOW_LATENCY_SEND_PHASE)) {
-        CUDA_CHECK(cudaMemsetAsync(workspace, 0, num_experts * sizeof(int), stream)); // only set atomic_counter_per_expert
-        CUDA_CHECK(cudaMemsetAsync(packed_recv_count, 0, sizeof(int) * num_experts / num_ranks, stream));
-        CUDA_CHECK(cudaMemsetAsync(per_rank_recv_count, 0, sizeof(int) * num_experts, stream));
+        //CUDA_CHECK(cudaMemsetAsync(workspace, 0, num_experts * sizeof(int), stream)); // only set atomic_counter_per_expert
+        //CUDA_CHECK(cudaMemsetAsync(packed_recv_count, 0, sizeof(int) * num_experts / num_ranks, stream));
+        //CUDA_CHECK(cudaMemsetAsync(per_rank_recv_count, 0, sizeof(int) * num_experts, stream));
     }
     // FP8 checks
     if (use_ue8m0)
@@ -1259,15 +1274,15 @@ combine(void* combined_x,
                             // intra node: just check tail tag
                             if (lane_id == 0) {
                                 int *__check_ptr = reinterpret_cast<int*>(buffer + msg_distance - sizeof(int4));
-                                int _value = ld_acquire_sys_global(__check_ptr);
-                                int w_cnt = 0;
+                                //int _value = ld_acquire_sys_global(__check_ptr);
+                                //int w_cnt = 0;
                                 //printf("[rank %d]: combine round 0x%08x token %d topk %d from expert %d check intra node tag at offset %lu, init 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, msg_distance - sizeof(int4), _value);
-                                while (_value != ZTAG(combine_round_n)) {
-                                    _value = ld_acquire_sys_global(__check_ptr);
-                                    w_cnt += 1;
-                                    if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, w_cnt, _value, ZTAG(combine_round_n));
-                                }
-                                //while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
+                                // while (_value != ZTAG(combine_round_n)) {
+                                //     _value = ld_acquire_sys_global(__check_ptr);
+                                //     w_cnt += 1;
+                                //     if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, w_cnt, _value, ZTAG(combine_round_n));
+                                // }
+                                while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
                                 //printf("[rank %d]: combine round 0x%08x token %d from expert %d check intra node tag done\n", rank, combine_round_n, token_idx, topk_idx_reg);
                                 // char tmatch[2][30] = {"", " WRONG COMBINE TAG!"};
                                 // for (int __pn = 0; __pn < pages; __pn += 1) {
@@ -1283,15 +1298,15 @@ combine(void* combined_x,
                             for (int __pn = lane_id; __pn < pages; __pn += 32) {
                                 int *__check_ptr = reinterpret_cast<int*>(buffer + ((__pn == pages - 1) ? (long_msg_ext_len) : ((__pn << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
                                 //EP_DEVICE_ASSERT(reinterpret_cast<uint8_t*>(__check_ptr) - buffer + sizeof(int) <= msg_distance);
-                                int _value = ld_acquire_sys_global(__check_ptr);
+                                //int _value = ld_acquire_sys_global(__check_ptr);
                                 //printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, init 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, reinterpret_cast<uint8_t*>(__check_ptr) - buffer, _value);
-                                int w_cnt = 0;
-                                while (_value != ZTAG(combine_round_n)) {
-                                    _value = ld_acquire_sys_global(__check_ptr);
-                                    w_cnt += 1;
-                                    if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
-                                }
-                                //while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
+                                // int w_cnt = 0;
+                                // while (_value != ZTAG(combine_round_n)) {
+                                //     _value = ld_acquire_sys_global(__check_ptr);
+                                //     w_cnt += 1;
+                                //     if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
+                                // }
+                                while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
                                 //printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu done\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, reinterpret_cast<uint8_t*>(__check_ptr) - buffer);
                             }
                         }
@@ -1446,12 +1461,12 @@ combine(void* combined_x,
             EP_DEVICE_ASSERT(num_warps_per_group > 1);
             if (sub_warp_id == 0 and lane_id == 0) {
                 const auto target_value = (SHORT_TAG(combine_round_n) | 1);
-                int w_cnt = 0, _value;
+                int _value;
                 while ((_value = ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx)) != target_value) {
-                    w_cnt += 1;
-                    if ((w_cnt & CHECK_TIME_MASK) == 0) {
-                        printf("[rank %d]: combine round 0x%08x waiting signal from expert %d for %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, responsible_expert_idx, w_cnt, _value, target_value);
-                    }
+                    // w_cnt += 1;
+                    // if ((w_cnt & CHECK_TIME_MASK) == 0) {
+                    //     printf("[rank %d]: combine round 0x%08x waiting signal from expert %d for %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, responsible_expert_idx, w_cnt, _value, target_value);
+                    // }
                 }
             }
         }
