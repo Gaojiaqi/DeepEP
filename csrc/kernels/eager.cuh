@@ -36,6 +36,7 @@ namespace deep_ep {
 
 #define DISPATCH_ROUND_INT 0x40000000
 #define COMBINE_ROUND_INT 0xc0000000
+#define ROUND_MASK 0x3fffffff
 
 #ifdef __CUDACC__
 
