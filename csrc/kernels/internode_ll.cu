@@ -82,14 +82,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
     constexpr size_t num_bytes_per_msg_v = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
-    constexpr size_t num_bytes_per_msg = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), AR_MSG_ALIGNMENT) : num_bytes_per_msg_v;
+    constexpr size_t num_bytes_per_msg = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_msg_v, AR_MSG_ALIGNMENT) : num_bytes_per_msg_v;
     // long message shall use extra int4 to jump the last tag of short message
     
     // WARNING!!! Two lines below must be consistent with msg def in config.hpp
     constexpr size_t dispatch_msg_max = sizeof(int4) + std::max(kHidden * sizeof(nv_bfloat16), kHidden + num_scales * sizeof(float));
     constexpr size_t combine_msg_max = num_scales * sizeof(nv_bfloat162) + kHidden * sizeof(nv_bfloat16);
-    constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int4), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_msg_v;
+    constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_msg_v;
     constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag jump position
+    constexpr size_t short_msg_final_tag = SHIFTED_ADDR(short_msg_len);
     //constexpr size_t long_msg_len = sizeof(int4) + kHidden * sizeof(nv_bfloat16); // BF16 dispatch / combine msg len;
 
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
@@ -129,39 +130,16 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             constexpr size_t scale_st_float_offset = kEager != EAGER_OFF ? (scale_st_offset / sizeof(float)) : 0;
             constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
             constexpr size_t page_int2 = page_int4 << 1;
-            constexpr size_t short_msg_int4 = short_msg_len / sizeof(int4);
+            //constexpr size_t short_msg_int4 = short_msg_len / sizeof(int4);
             const size_t data_st_int4_offset = 
             kEager != EAGER_OFF ? 
-                (kHidden == 8192 ?  
-                    ((thread_id + 1) < page_int4 ? 0 : (thread_id + 1) < 2 * page_int4 ? 1 : (thread_id + 1) < short_msg_int4 ? 2 : (thread_id + 2) < 3 * page_int4 ? 3 : 4) :
-                    (kHidden >= 4096 ? 
-                        ((thread_id + 1) < page_int4 ? 0 : (thread_id + 1) < short_msg_int4 ? 1 : (thread_id + 2) < 2 * page_int4 ? 2 : (thread_id + 2) < 3 * page_int4 ? 3 : 4) : 
-                        ((thread_id + 1) < short_msg_int4 ? 0 : (thread_id + 1) < page_int4 ? 1 : (thread_id + 2) < 2 * page_int4 ? 2 : (thread_id + 2) < 3 * page_int4 ? 3 : 4)))
+                ((thread_id + 1) < page_int4 ? 0 : (thread_id + 1) < 2 * page_int4 ? 1 : (thread_id + 1) < 3 * page_int4 ? 2 : (thread_id + 1) < 4 * page_int4 ? 3 : 4)
                 : 0;
             const size_t data_st_int2_offset = kEager != EAGER_OFF ? ((thread_id + 2) < page_int2 ? 0 : (thread_id + 2) < 2 * page_int2 ? 2 : 4) : 0;
             
             //const size_t int4_pos = thread_id + 1 + ((thread_id + 1) >= short_msg_int4 ? 1 : 0);
             //const size_t data_st_int4_offset = int4_pos < page_int4 ? 0 : (int4_pos < 2 * page_int4 ? 1 : (int4_pos < 3 * page_int4 ? 2 : 3));
-#define DISPATCH_LD(ld_func, ptr) ((kEager != EAGER_OFF) ? LD_SHIFTED(ld_func, ptr, src_src_idx) : ld_func(ptr))
-// #define DISPATCH_ST(PTR, VALUE) {\
-//     if constexpr (kEager != EAGER_OFF) {\
-//         if constexpr (kUseFP8) {\
-//             auto sfp = SHIFTED_ADDR_P(PTR, rdma_x_src_idx);\
-//             *sfp = VALUE;\
-//             /*if (IS_PAGE_SUB_HEAD((PTR) + 1, rdma_x_src_idx, num_bytes_per_msg_v)) *reinterpret_cast<int*>(sfp + 1) = ZTAG(dispatch_round_n)*/;\
-//         } else {\
-//             auto sfp = SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len);\
-//             *sfp = VALUE;\
-//             /*printf("[rank %d]: dispatch round 0x%08x st at offset %lu\n", rank, dispatch_round_n, PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len), rdma_x_src_idx))*/;\
-//             /*if ((PTR_DIFF(sfp + 1, rdma_x_src_idx) & PCIE_SEG_LEN_MASK) == (PCIE_SEG_LEN - PCIE_TAIL_SZ) || PTR_DIFF(PTR + 1, rdma_x_src_idx) == num_bytes_per_msg_v) {\
-//                 *reinterpret_cast<int*>(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1) = ZTAG(dispatch_round_n);\
-//                 printf("[rank %d]: dispatch round 0x%08x st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, ZTAG(dispatch_round_n), PTR_DIFF(SHIFTED_ADDR_PS(PTR, rdma_x_src_idx, short_msg_len) + 1, rdma_x_src_idx));\
-//             }*/\
-//         }\
-//     } else {\
-//         NORMAL_ST(PTR, VALUE);\
-//     }\
-// }
+//#define DISPATCH_LD(ld_func, ptr) ((kEager != EAGER_OFF) ? LD_SHIFTED(ld_func, ptr, src_src_idx) : ld_func(ptr))
 
             if (thread_id == 0) {
                 //DISPATCH_ST(rdma_x_src_idx, token_idx);
@@ -215,7 +193,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 //const auto warp_runs = hidden_bf16_int4 / 32;
                 //const auto idle_warp_id = (warp_id + (num_warps - 1) - (warp_runs % (num_warps - 1))) % (num_warps - 1);
                 if (warp_id == 0) {
-                    PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), dispatch_round_n, thread_id, num_threads, NORMAL_ST);
+                    PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg, dispatch_round_n, thread_id, num_threads, NORMAL_ST);
                 }
             }
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
@@ -242,8 +220,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-                    WARP_SET_TAIL_TAG(dst_p2p_ptr, msg_distance - sizeof(int4), ZTAG(dispatch_round_n));
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg - (kEager == EAGER_OFF ? 0 : 1), dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    WARP_SET_TAIL_TAG(dst_p2p_ptr, num_bytes_per_msg - sizeof(int4), ZTAG(dispatch_round_n));
                     // if constexpr (kEager == EAGER_FULL) {
                     //     __syncwarp();
                     //     lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
@@ -361,36 +339,41 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         //     }
         // }
     }
-    if constexpr (kEager != EAGER_FULL) {
-        
+    if constexpr (kEager != EAGER_FULL) {   
         __syncthreads();
         // Issue count sends
         if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
             const auto dst_rank = responsible_expert_idx / num_local_experts;
             const auto dst_expert_local_idx = responsible_expert_idx % num_local_experts;
-            const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups];
-
+            const auto num_tokens_sent = -shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups]-1;
+            const auto send_cnt = kEager == EAGER_FULL ? (SHORT_TAG(dispatch_round_n) | (num_tokens_sent & 0xffff)) : num_tokens_sent;
             // Wait local sends issued and send expert counts
-            while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+            if constexpr (kEager == EAGER_OFF) {
+                while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+            } else {
+                while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG);
+            }
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
             auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
             if (dst_p2p_ptr == 0) {
                 if constexpr (kEager <= EAGER_OFF) {
-                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), send_cnt, dst_rank, dst_expert_local_idx);
                 } else {
-                    nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+                    nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), send_cnt, dst_rank, dst_expert_local_idx);
                 }
             } else {
-                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
+                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), send_cnt);
             }
 
             // Clean workspace for next use
             atomic_counter_per_expert[responsible_expert_idx] = 0;
             atomic_finish_counter_per_expert[responsible_expert_idx] = 0;
 
-            // Clean `packed_recv_count`
-            if (dst_rank == 0)
-                packed_recv_count[dst_expert_local_idx] = 0;
+            if constexpr (kEager != EAGER_FULL) {
+                // Clean `packed_recv_count`
+                if (dst_rank == 0)
+                    packed_recv_count[dst_expert_local_idx] = 0;
+            }
         }
         __syncwarp();
     }
@@ -492,7 +475,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             
             if constexpr (kEager == EAGER_FULL) {
                 //if (!ld_intra_node) {
-                    WAIT_2BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node);
+                    WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node);
                     __syncwarp();
                     num_recv_tokens = warp_reduce_min(num_recv_tokens);
                     
@@ -514,7 +497,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     if (lane_id == 0) {
                         this_token_index_in_recv = atomic_add_release_global(packed_recv_count + local_expert_idx, 1);
                         atomicAdd(per_rank_recv_cnt_ptr, 1);
-                        //printf("[rank %d]: dispatch recv token expert %d slot %d get rank %d token %d\n", rank, global_expert_idx, this_token_index_in_recv, src_rank, DISPATCH_LD(ld_nc_global, src_src_idx));
+                        //printf("[rank %d]: dispatch recv token expert %d slot %d get rank %d token %d\n", rank, local_expert_idx + rank * num_local_experts, this_token_index_in_recv, src_rank, ld_nc_global(src_src_idx));
                         token_src_bitmap[i] = this_token_index_in_recv;
                     }
                     __syncwarp();
@@ -526,7 +509,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 //     }
                 // }
             } else if constexpr (kEager != EAGER_OFF) {
-                WAIT_BIT(src_src_idx, num_bytes_per_msg_v + (kUseFP8 ? 0 : sizeof(int4)), num_bytes_per_msg, lane_id, 32, dispatch_round_n, ld_intra_node);
+                WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, ld_intra_node);
                 __syncwarp();
             }
             
@@ -535,7 +518,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             }
 
             if (lane_id == 0)
-                recv_src_info[this_token_index_in_recv] = DISPATCH_LD(ld_nc_global, src_src_idx);
+                recv_src_info[this_token_index_in_recv] = ld_nc_global(src_src_idx);
             __syncwarp();
 
             // Copy data
@@ -543,26 +526,27 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + this_token_index_in_recv * hidden_int4;
             if constexpr (kEager != EAGER_OFF) {
-                UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, ld_nc_global, st_na_global);
                 // constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
-                // if constexpr (kUseFP8) {
-                //     size_t copy_done = 0;
-                //     size_t offset = 0;
-                //     while (copy_done < hidden_int4) {
-                //         size_t to_copy = min(page_int4 - (offset == 0 ? 1 : 0), hidden_int4 - copy_done);
-                //         auto src_data_ = src_data + copy_done + offset;
-                //         auto dst_data_ = dst_data + copy_done;
-                //         UNROLLED_WARP_COPY(7, lane_id, to_copy, dst_data_, src_data_, ld_nc_global, st_na_release);
-                //         offset += 1;
-                //         copy_done += to_copy;
-                //     }
+                // // if constexpr (kUseFP8) {
+                // size_t copy_done = 0;
+                // size_t offset = 0;
+                // while (copy_done < hidden_int4) {
+                //     size_t to_copy = min(page_int4 - (offset == 0 ? 1 : 0), hidden_int4 - copy_done);
+                //     auto src_data_ = src_data + copy_done + offset;
+                //     auto dst_data_ = dst_data + copy_done;
+                //     UNROLLED_WARP_COPY(7, lane_id, to_copy, dst_data_, src_data_, ld_nc_global, st_na_release);
+                //     offset += 1;
+                //     copy_done += to_copy;
+                // }
                 // } else {
                 //     UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, short_msg_len, ld_nc_global, st_na_global);
                 // }
             } else {
                 UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
             }
-
+            constexpr size_t scale_ld_offset = sizeof(int4) * (kHidden == 8192 ? 2 : (kHidden < 4096 ? 0 : 1));
+            constexpr size_t scale_ld_float_offset = kEager != EAGER_OFF ? (scale_ld_offset / sizeof(float)) : 0;
             // Copy scales
             if constexpr (kUseFP8) {
                 // Equivalent CuTe layout:
@@ -575,14 +559,20 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 if (lane_id < num_scales) {
                     const auto pack_idx = lane_id / num_elems_per_pack;
                     const auto elem_idx = lane_id % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(DISPATCH_LD(ld_nc_global, src_scales + lane_id));
+                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + scale_ld_float_offset));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
                 if (lane_id + 32 < num_scales) {
                     const auto pack_idx = (lane_id + 32) / num_elems_per_pack;
                     const auto elem_idx = (lane_id + 32) % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(DISPATCH_LD(ld_nc_global, src_scales + lane_id + 32));
+                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32 + scale_ld_float_offset));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
+                }
+            } else {
+                if constexpr (kEager != EAGER_OFF) {
+                    if (lane_id == 0) {
+                        src_src_idx[short_msg_final_tag / sizeof(int)] = 0;
+                    }
                 }
             }
         }
@@ -1042,7 +1032,7 @@ combine(void* combined_x,
                         tma_offset_bytes += num_tma_bytes;
                     } else {
                         // BF16 original values
-#define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, short_msg_ext_len, combine_round_n, kEager_combine)
+#define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, combine_round_n, kEager_combine)
                         if constexpr (kEager_combine == EAGER_OFF) {
                             if (elect_one_sync(lane_id)) {
                                 auto w_offset_int4 = iter_idx * kNumSendUnrolls * 32; // i is dynamic...
@@ -1079,12 +1069,12 @@ combine(void* combined_x,
                             //__tail_tags[__pn] = warp_reduce_or(__tail_tags[__pn]);
                             __tail_tags[__pn] = __shfl_sync(0xffffffff, __tail_tags[__pn], 0);
                         }
-                        __tail_tags[MAX_PAGES + 1] = __shfl_sync(0xffffffff, __tail_tags[MAX_PAGES + 1], 1);
+                        //__tail_tags[MAX_PAGES + 1] = __shfl_sync(0xffffffff, __tail_tags[MAX_PAGES + 1], 1);
 
                         //EP_DEVICE_ASSERT(lane_id == get_lane_id());
                         EP_STATIC_ASSERT((kHidden * sizeof(nv_bfloat16)) % sizeof(int4) == 0, "combine message len (no logfmt) shall be a multiple of int4");
-                        if (lane_id < MAX_PAGES_DIV4 + 1) {
-                            auto target_ptr = cpy_dst_int4_ptr + (lane_id < MAX_PAGES_DIV4 ? (hidden_bf16_int4 + lane_id) : (long_msg_ext_len_int4));
+                        if (lane_id < MAX_PAGES_DIV4) {
+                            auto target_ptr = cpy_dst_int4_ptr + (hidden_bf16_int4 + lane_id);
                             //EP_DEVICE_ASSERT((target_ptr + 1 - cpy_dst_int4_ptr) * sizeof(int4) <= msg_distance);
                             //printf("[rank %d]: exp %d send back rank %d token %d, put %d stored value and last tag, {0x%08x, 0x%08x, 0x%08x, 0x%08x} offset %lu\n", rank, global_expert_idx, dst_rank, src_idx, lane_id, __tail_tags_int4[lane_id].x, __tail_tags_int4[lane_id].y, __tail_tags_int4[lane_id].z, __tail_tags_int4[lane_id].w, (target_ptr - cpy_dst_int4_ptr) * sizeof(int4));
                             // if (lane_id == MAX_PAGES_DIV4) EP_DEVICE_ASSERT(__tail_tags_int4[lane_id].x == ZTAG(combine_round_n));
@@ -1102,8 +1092,11 @@ combine(void* combined_x,
                             //     printf("[rank %d]: exp %d send back rank %d token %d, put %d stored value and last tag, {0x%08x, 0x%08x, 0x%08x, 0x%08x} offset %lu, but check mismatch\n", rank, global_expert_idx, dst_rank, src_idx, lane_id, __tail_tags_int4[lane_id].x, __tail_tags_int4[lane_id].y, __tail_tags_int4[lane_id].z, __tail_tags_int4[lane_id].w, (target_ptr - cpy_dst_int4_ptr) * sizeof(int4));
                             // }
                         }
+                        if (!intra_node && lane_id == 0) {
+                            *reinterpret_cast<int*>(cpy_dst_int4_ptr + long_msg_ext_len_int4 - 1) = ZTAG(combine_round_n);
+                        }
                         __syncwarp();
-                        num_send_bytes = EXTEND_FOR_TAG_AND_ALIGN(long_msg_len + sizeof(int4), sizeof(int4)); // extra tag store space
+                        num_send_bytes = long_msg_ext_len; // extra tag store space
                     }
                 }
 
@@ -1113,7 +1106,7 @@ combine(void* combined_x,
                 if constexpr (kEager_combine != EAGER_OFF) {
                     if (intra_node && lane_id == 0) {
                         // intranode: only write last tag to signal token ready!
-                        st_release_sys_global(reinterpret_cast<int*>(cpy_dst_int4_ptr + msg_distance / sizeof(int4) - 1), ZTAG(combine_round_n));
+                        st_release_sys_global(reinterpret_cast<int*>(cpy_dst_int4_ptr + long_msg_ext_len_int4 - 1), ZTAG(combine_round_n));
                         //printf("[rank %d]: exp %d send back rank %d token %d, put intra node tag, offset %lu\n", rank, global_expert_idx, dst_rank, src_idx, msg_distance - sizeof(int4));
                     }
                 }
@@ -1213,7 +1206,7 @@ combine(void* combined_x,
 
     if (group_idx < num_groups) {
         constexpr int kNumStages = 3;
-        constexpr int kNumTMABufferBytes = 16 * 2 + ((kEager_combine == EAGER_OFF) ? (kHidden * sizeof(nv_bfloat16)) : (long_msg_ext_len + sizeof(int4))); // WARNING: use metabytes for logfmt, assume redundant region is enough!
+        constexpr int kNumTMABufferBytes = 16 * 2 + ((kEager_combine == EAGER_OFF) ? (kHidden * sizeof(nv_bfloat16)) : (long_msg_ext_len - sizeof(int4))); // WARNING: use metabytes for logfmt, assume redundant region is enough!
         // if (sm_id == 0 && thread_id == 0) {
         //     printf("[rank %d]: TMABufferBytes = %d\n", rank, kNumTMABufferBytes);
         // }
@@ -1261,19 +1254,19 @@ combine(void* combined_x,
                     int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
                     if (topk_idx_reg < 0)
                         continue;
-                    const int src_rank = topk_idx_reg / num_local_experts;
-                    const auto intra_node = (src_rank >> 3) == (rank >> 3);
+                    //const int src_rank = topk_idx_reg / num_local_experts;
+                    //const auto intra_node = (src_rank >> 3) == (rank >> 3);
                     //if (!intra_node) printf("[rank %d]: an inter-node combine recv\n", rank);
                     //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0) printf("tma load warp waiting on mbarrier\n");
                     mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
                     auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
                     //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0) printf("tma load warp pass mbarrier\n");
                     if constexpr (kEager_combine != EAGER_OFF) {
-                        constexpr int pages = PAGE_N(long_msg_len);
-                        if (intra_node) {
+                        // constexpr int pages = PAGE_N(long_msg_len);
+                        // if (intra_node) {
                             // intra node: just check tail tag
-                            if (lane_id == 0) {
-                                int *__check_ptr = reinterpret_cast<int*>(buffer + msg_distance - sizeof(int4));
+                        if (lane_id == 0) {
+                                int *__check_ptr = reinterpret_cast<int*>(buffer + long_msg_ext_len - sizeof(int4));
                                 //int _value = ld_acquire_sys_global(__check_ptr);
                                 //int w_cnt = 0;
                                 //printf("[rank %d]: combine round 0x%08x token %d topk %d from expert %d check intra node tag at offset %lu, init 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, msg_distance - sizeof(int4), _value);
@@ -1291,12 +1284,12 @@ combine(void* combined_x,
                                 //     printf("[rank %d]: combine round 0x%08x token %d from expert %d inter node tag 0x%08x at offset %lu %s\n", rank, combine_round_n, token_idx, topk_idx_reg, __check_val, PTR_DIFF(__check_ptr, buffer), tmatch[__check_val != ZTAG(combine_round_n)]);
                                 // }
                                 // printf("[rank %d]: combine round 0x%08x token %d from expert %d last jump tag 0x%08x at offset %lu\n", rank, combine_round_n, token_idx, topk_idx_reg, ld_nc_global(reinterpret_cast<int*>(buffer + long_msg_ext_len + sizeof(int))), long_msg_ext_len + sizeof(int));
-                            }
-                        } else {
+                            //}
+                        //} else {
                             // inter node: check tags of all pages
-                            #pragma unroll
-                            for (int __pn = lane_id; __pn < pages; __pn += 32) {
-                                int *__check_ptr = reinterpret_cast<int*>(buffer + ((__pn == pages - 1) ? (long_msg_ext_len) : ((__pn << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
+                            // #pragma unroll
+                            // for (int __pn = lane_id; __pn < pages; __pn += 32) {
+                            //     int *__check_ptr = reinterpret_cast<int*>(buffer + ((__pn == pages - 1) ? (long_msg_ext_len) : ((__pn << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
                                 //EP_DEVICE_ASSERT(reinterpret_cast<uint8_t*>(__check_ptr) - buffer + sizeof(int) <= msg_distance);
                                 //int _value = ld_acquire_sys_global(__check_ptr);
                                 //printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, init 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, reinterpret_cast<uint8_t*>(__check_ptr) - buffer, _value);
@@ -1306,9 +1299,9 @@ combine(void* combined_x,
                                 //     w_cnt += 1;
                                 //     if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
                                 // }
-                                while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
+                                //while (ld_acquire_sys_global(__check_ptr) != ZTAG(combine_round_n));
                                 //printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu done\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, reinterpret_cast<uint8_t*>(__check_ptr) - buffer);
-                            }
+                            //}
                         }
                         __syncwarp();
                         // if (!intra_node) {
@@ -1334,7 +1327,7 @@ combine(void* combined_x,
                         }
                         int num_tma_bytes;
                         if constexpr (kEager_combine != EAGER_OFF) {
-                            num_tma_bytes = long_msg_ext_len + sizeof(int4);
+                            num_tma_bytes = long_msg_ext_len - sizeof(int4);
                         } else {
                             num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
                         }
@@ -1380,7 +1373,7 @@ combine(void* combined_x,
                         //auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
                         constexpr int pages = PAGE_N(long_msg_len);
                         if (true) {
-                            if (decode_warp_idx == 0 && lane_id < pages) {
+                            if (decode_warp_idx == 0 && lane_id < pages - 1) {
                                 //EP_DEVICE_ASSERT((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ) < kHidden * sizeof(nv_bfloat16) - sizeof(int));
                                 // int space;
                                 // nv_bfloat16* space_ptr = reinterpret_cast<nv_bfloat16*>(&space);
@@ -1388,8 +1381,8 @@ combine(void* combined_x,
                                 // space_ptr[1] = space_ptr[0];
                                 //EP_DEVICE_ASSERT(reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id] == space);
                                 //printf("[rank %d]: debug: wriring shmem\n", rank);
-                                const auto ld_offset = (lane_id < pages - 1) ? (kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id) : (long_msg_ext_len + sizeof(int));
-                                const auto st_offset = (lane_id < pages - 1) ? ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ)) : short_msg_ext_len;
+                                const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;
+                                const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));
                                 int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + ld_offset)); // reinterpret_cast<int*>(ld_tags_int4[group_idx][stage_idx])[lane_id]
                                 //printf("[rank %d]: combine round 0x%08x token %d from expert %d restore value 0x%08x from %lu to %lu\n", rank, combine_round_n, token_idx, topk_idx, save_value, ld_offset, st_offset);
                                 //INT_VALUE_NO_NAN(save_value);
@@ -1423,7 +1416,12 @@ combine(void* combined_x,
                 }
                 //asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));
                 //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0 && decode_warp_idx == 0) printf("reduce warp finish all reduce, waiting for tma store done\n");
-
+                if constexpr (kEager_combine != EAGER_OFF) {
+                    if (decode_warp_idx == 0 && lane_id == 0) {
+                        auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_by_lane * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance + short_msg_ext_len;
+                        *reinterpret_cast<int*>(buffer) = 0; // reset short message tail tag
+                    }
+                }
                 tma_store_wait<0>();
 
                 //if (sm_id == 0 && rank == 0 && group_idx == 0 && lane_id == 0 && decode_warp_idx == 0) printf("reduce warp finish all reduce, load reduce result to share mem\n");

@@ -160,7 +160,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                         else:
                                             assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
                                     else:
-                                        assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: Error exp {expert_id}, {num_valid_tokens} tokens, token second part, min range {all_value_range(recv_x[:, -128:].amin(dim=-1))}, max range {all_value_range(recv_x[:, -128:].amax(dim=-1))}'
+                                        assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part, min range {all_value_range(recv_x[:, -128:].amin(dim=-1))}, max range {all_value_range(recv_x[:, -128:].amax(dim=-1))}, sample range={"\n".join([all_value_range(recv_x[z, -128:]) for z in range(recv_x.shape[0])])}'
                                         assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: Error exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
                                     for j in range(num_ranks):
                                         if eager_opt != deep_ep.Buffer.EAGER_FULL:
