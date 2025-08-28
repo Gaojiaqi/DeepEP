@@ -91,6 +91,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     #topk_idx = torch.stack([(torch.arange(num_topk) + i + num_experts // num_ranks * rank) % num_experts for i in range(num_tokens)]).cuda()
+    #topk_idx = torch.stack([(torch.arange(num_topk) + num_experts - num_topk) % num_experts for i in range(num_tokens)]).cuda()
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
     #topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') / num_topk
 
@@ -235,9 +236,11 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         large_gemm_with_hook(hook) if return_recv_hook else None
         #print(f'[rank {rank}]: test combine begin', flush=True)
         #print(f'[rank {rank}]: combine func bench, {return_recv_hook=}, cnt=0x{combine_round:x}', flush=True)
+        #dist.barrier()
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
         large_gemm_with_hook(hook) if return_recv_hook else None
+        #dist.barrier()
         #print(f'[rank {rank}]: combine bench done, {return_recv_hook=}, cnt=0x{combine_round:x}', flush=True)
         #dispatch_round += 1
         #combine_round += 1
@@ -266,7 +269,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             group.barrier()
             dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=return_recv_hook),
                                                 kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                                suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, trace_path=trace_name)
+                                                suppress_kineto_output=False, num_kernels_per_period=2 if return_recv_hook else 1, trace_path=trace_name)
             if not return_recv_hook:
                 print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                     f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)

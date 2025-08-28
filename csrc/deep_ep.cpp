@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <memory>
 #include <pybind11/functional.h>
@@ -10,6 +11,7 @@
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
 #include "kernels/eager.cuh"
+#include "kernels/exception.cuh"
 
 namespace deep_ep {
 
@@ -229,7 +231,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
 
         // Allocate
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
-
+        //printf("alloc %lu bytes for RDMA\n", num_rdma_bytes);
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
@@ -1131,7 +1133,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
-
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -1139,6 +1140,13 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
+
+    const auto recv_buffer_size = num_experts * num_max_dispatch_tokens_per_rank * 14848;
+    EP_HOST_ASSERT(layout.buffers[1].dispatch_rdma_recv_data_buffer = layout.buffers[1].combine_rdma_recv_data_buffer);
+    EP_HOST_ASSERT(layout.buffers[0].dispatch_rdma_recv_data_buffer = layout.buffers[0].combine_rdma_recv_data_buffer);
+    EP_HOST_ASSERT(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) - reinterpret_cast<uint8_t*>(layout.buffers[0].dispatch_rdma_recv_data_buffer) == recv_buffer_size);
+    
+    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) + recv_buffer_size - sizeof(int), 0, sizeof(int), launch_stream));
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
@@ -1272,6 +1280,13 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
+
+    const auto recv_buffer_size = num_experts * num_max_dispatch_tokens_per_rank * 14848;
+    EP_HOST_ASSERT(layout.buffers[1].dispatch_rdma_recv_data_buffer = layout.buffers[1].combine_rdma_recv_data_buffer);
+    EP_HOST_ASSERT(layout.buffers[0].dispatch_rdma_recv_data_buffer = layout.buffers[0].combine_rdma_recv_data_buffer);
+    EP_HOST_ASSERT(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) - reinterpret_cast<uint8_t*>(layout.buffers[0].dispatch_rdma_recv_data_buffer) == recv_buffer_size);
+    
+    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) + recv_buffer_size - sizeof(int), 0, sizeof(int), launch_stream));
 
     // Allocate output tensor
     torch::Tensor combined_x;

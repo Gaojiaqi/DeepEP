@@ -170,7 +170,8 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define CHECK_TIME_MASK 0xfffff
+#define CHECK_TIME_MASK 0xffffff
+#define FINAL_TIME_MASK 0x10000000
 
 #define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, intra_node) {\
     int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
@@ -192,7 +193,8 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
                 }\
             }\
             /*w_cnt += 1;\
-            if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu for %d times, 0x%08x != 0x%08x\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv))*/;\
+            if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu (abs %lu) for %d times, 0x%08x != 0x%08x, cnt = %d(%d)\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), PTR_DIFF(_check_ptr, rdma_recv_x), w_cnt, ld_value, ZTAG(tagv), count_value, -count_value-1);\
+            if (w_cnt == FINAL_TIME_MASK) break*/;\
         };\
     }\
 }
