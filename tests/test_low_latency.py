@@ -170,6 +170,9 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                 assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
                                         else:
                                             if not round_scale:
+                                                # print(f'[rank {rank}]: expert {expert_id} per_rank_recv_count[{j}]=', per_rank_recv_count[j].item())
+                                                # assert per_rank_recv_count[j].item() <= num_tokens
+                                                # print(f'[rank {rank}]: expert {expert_id} slots {token_pos_int[j][:per_rank_recv_count[j].item()]}')
                                                 hit_tokens_main = recv_x[token_pos_int[j][:per_rank_recv_count[j]], :-128]
                                                 if (hit_tokens_main != (j - rank_offset)).sum().item() != 0:
                                                     for hi in range(hit_tokens_main.shape[0]):
