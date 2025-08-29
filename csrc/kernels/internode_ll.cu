@@ -419,10 +419,10 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 int cur_v = atomic_add_release_global(recv_cnt_barrier, 1);
                 st_release_cta(per_rank_recv_cnt_ptr, 0);
                 if (cur_v != num_ranks - 1) {
-                    while (ld_nc_global(recv_cnt_barrier) != 0);
+                    while (ld_acquire_global(recv_cnt_barrier) != 0);
                 } else {
                     st_na_global(packed_recv_count + local_expert_idx, 0);
-                    st_na_global(recv_cnt_barrier, 0);
+                    st_na_release(recv_cnt_barrier, 0);
                 }
             }
             asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(num_warps_per_group * 32));
