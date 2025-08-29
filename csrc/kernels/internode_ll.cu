@@ -90,7 +90,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     constexpr size_t combine_msg_max = num_scales * sizeof(nv_bfloat162) + kHidden * sizeof(nv_bfloat16);
     constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int4), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_msg_v;
     constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag jump position
-    //constexpr size_t short_msg_final_tag = SHIFTED_ADDR(short_msg_len);
+    constexpr size_t short_msg_final_tag = SHIFTED_ADDR(short_msg_len);
     //constexpr size_t long_msg_len = sizeof(int4) + kHidden * sizeof(nv_bfloat16); // BF16 dispatch / combine msg len;
 
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
@@ -558,8 +558,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             } else {
                 if constexpr (kEager != EAGER_OFF) {
                     if (!ld_intra_node && lane_id == 0) {
-                        N_ST_SHIFTED(reinterpret_cast<int*>(src_data + hidden_int4), 0, src_src_idx);
-                        //src_src_idx[short_msg_final_tag / sizeof(int)] = 0;
+                        //N_ST_SHIFTED(reinterpret_cast<int*>(src_data + hidden_int4), 0, src_src_idx);
+                        src_src_idx[short_msg_final_tag / sizeof(int)] = 0;
                     }
                 }
             }
