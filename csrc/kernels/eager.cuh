@@ -183,6 +183,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             ld_value = ld_acquire_sys_global(_check_ptr);\
             if (ld_value == ZTAG(tagv)) {\
                 /*printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d get expected tag 0x%08x at offset: %lu\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, ld_value, PTR_DIFF(_check_ptr, recv_buf))*/;\
+                _check_ptr = 0;\
                 break;\
             }\
             if (count_value == 0) {\

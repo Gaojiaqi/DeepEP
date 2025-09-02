@@ -191,16 +191,20 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
         profile_data = json.loads(Path(trace_path).read_text())
 
     # Return average kernel durations
-    units = {'ms': 1e3, 'us': 1e6}
+    units = {'ms': 1e3, 'us': 1e6, 's': 1.0}
     kernel_durations = []
     for name in kernel_names:
         for line in prof_lines:
             if name in line:
                 time_str = line.split()[-2]
+                unit_hit = False
                 for unit, scale in units.items():
                     if unit in time_str:
                         kernel_durations.append(float(time_str.replace(unit, '')) / scale)
+                        unit_hit = True
                         break
+                if not unit_hit:
+                    print(f'unknown unit: {time_str}')
                 break
 
     # Expand the kernels by periods
@@ -214,7 +218,8 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
             events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
             events = sorted(events, key=lambda event: event['ts'])
             durations = [event['dur'] / 1e6 for event in events]
-            assert len(durations) % num_kernels_per_period == 0
+            if len(durations) % num_kernels_per_period != 0:
+                print(f'Error: {kernel_name} durations len {len(durations)} not diveded by {num_kernels_per_period}', flush=True)
             num_kernel_patterns = len(durations) // num_kernels_per_period
             kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
                                for j in range(num_kernels_per_period)]

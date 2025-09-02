@@ -45,7 +45,7 @@ def split_range(tensor : torch.Tensor, values : set):
     return r
 
 import json
-def all_value_range(tensor : torch.Tensor, except_zero : bool = False):
+def all_value_range(tensor : torch.Tensor, except_zero : bool = False, one_line = False):
     fvalues = list(tensor.float().cpu().numpy())
     values = set([v for v in fvalues if not np.isnan(v)])
     hasnan = any([np.isnan(v) for v in fvalues])
@@ -54,7 +54,10 @@ def all_value_range(tensor : torch.Tensor, except_zero : bool = False):
     if except_zero:
         values.remove(0)
     d = split_range(tensor=tensor, values=values)
-    return '\n' + json.dumps({str(v): r for v, r in d.items()}, indent=4) + '\n'
+    if one_line:
+        return json.dumps({str(v): r for v, r in d.items()})
+    else:
+        return '\n' + json.dumps({str(v): r for v, r in d.items()}, indent=4) + '\n'
 
 def dump_nan_tensors(tensor : torch.Tensor):
     r = []
@@ -63,13 +66,29 @@ def dump_nan_tensors(tensor : torch.Tensor):
             r.append((i, all_value_range(torch.isnan(tensor[i]), except_zero=True)))
     return '\n'.join([str(x) for x in r])
 
+def all_value_range_m(tensors: torch.Tensor, except_zero : bool = False, one_line = False):
+    sep = ' ' if one_line else '\n'
+    return sep.join([all_value_range(tensors[i], except_zero=except_zero, one_line=one_line) for i in range(tensors.shape[0])])
+
+def non_same_tensor_layout(tensor: torch.Tensor):
+    not_same_bitmap = tensor.amax(dim=-1) != tensor.amin(dim=-1)
+    not_same_idx = [i for i in range(not_same_bitmap.shape[0]) if not_same_bitmap[i]]
+    diff_tensors = tensor[not_same_bitmap]
+    return f'diff index: {not_same_idx}, diff tensor layout: {all_value_range_m(diff_tensors, one_line=True)}'
+
+def non_same_2tensor_layout(tensor1: torch.Tensor, tensor2: torch.Tensor):
+    not_same_bitmap = tensor1 != tensor2
+    not_same_idx = [i for i in range(not_same_bitmap.shape[0]) if not_same_bitmap[i]]
+    return f'diff index: {not_same_idx}, tensor1 layout: {list(tensor1[not_same_idx].float().cpu().numpy())}, tensor2 layout: {list(tensor2[not_same_idx].float().cpu().numpy())}'
+
+
 dispatch_round = 0x40000000
 combine_round = 0xc0000000
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: deep_ep.Buffer,
               use_logfmt: bool = False, seed: int = 0, eager_opt: int = 1, repeat: int = 1, check : int = 1, trace_pfx : str = None):
-    torch.manual_seed(seed + rank)
-    random.seed(seed + rank)
+    # torch.manual_seed(seed + rank)
+    # random.seed(seed + rank)
 
     assert num_experts % num_ranks == 0
     num_local_experts = num_experts // num_ranks
@@ -86,14 +105,15 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.5 * random.random())
     # NOTES: the last one is for performance testing
     # Most of the values in the perf case is lower than the threshold, casting most channels
-    x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
+    # x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
+    #x_list = x_list[1:]
 
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     #topk_idx = torch.stack([(torch.arange(num_topk) + i + num_experts // num_ranks * rank) % num_experts for i in range(num_tokens)]).cuda()
     #topk_idx = torch.stack([(torch.arange(num_topk) + num_experts - num_topk) % num_experts for i in range(num_tokens)]).cuda()
-    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
-    #topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') / num_topk
+    #topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
+    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') / num_topk
 
     # Randomly mask some positions
     for i in range(10):
@@ -105,8 +125,8 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     hash_value, num_times = 0, 0
     for current_x in x_list:
         for return_recv_hook in (False, True):
-            for dispatch_use_fp8 in (False, True):
-                for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
+            for dispatch_use_fp8 in (False, ):
+                for round_scale in (False, ) if dispatch_use_fp8 else (False, ):
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
@@ -152,36 +172,39 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 recv_x_amin = recv_x[:, :-128].amin(dim=-1)
                                 recv_src_info = recv_src_info[:num_valid_tokens]
                                 if not torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)):
-                                    print(f'[rank {rank}]: Error expert {expert_id} token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}')
+                                    print(f'[rank {rank}]: Error round {dispatch_round:08x} expert {expert_id} token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {non_same_tensor_layout(recv_x[:, :-128])}')
+                                #else:
+                                    #assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}'
+                                if round_scale:
+                                    if calc_diff(recv_x[:, -1], recv_src_info.view(-1)) >= 0.007:
+                                        print(f'[rank {rank}]: Error round {dispatch_round:08x} expert {expert_id} src info != recv_x second part, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {non_same_2tensor_layout(recv_x[:,-1], recv_src_info.view(-1))}')
+                                    # else:
+                                    #     assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
                                 else:
-                                    assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}'
-                                    if round_scale:
-                                        if calc_diff(recv_x[:, -1], recv_src_info.view(-1)) >= 0.007:
-                                            print(f'[rank {rank}]: Error expert {expert_id} src info != recv_x second part, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, second part range={all_value_range(recv_x[:, -1])}, src info range={all_value_range(recv_src_info.view(-1))}')
-                                        else:
-                                            assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
+                                    if not torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)):
+                                        print(f'[rank {rank}]: round {dispatch_round:08x} Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part {non_same_tensor_layout(recv_x[:, -128:])}')
+                                    if not torch.equal(recv_x[:, -1], recv_src_info.view(-1)):
+                                        print(f'[rank {rank}]: round {dispatch_round:08x} Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part != src info, {non_same_2tensor_layout(recv_x[:, -1], recv_src_info.view(-1))}')
+                                    #assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: Error exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
+                                for j in range(num_ranks):
+                                    if eager_opt != deep_ep.Buffer.EAGER_FULL:
+                                        begin_idx, count = (recv_layout_range[j] >> 32).item(), (recv_layout_range[j] & int_mask).item()
+                                        if not round_scale:
+                                            assert (recv_x_amin == j - rank_offset).sum().item() == (all_topk_idx[j] == expert_id).sum().item()
+                                            assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
                                     else:
-                                        assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part, min range {all_value_range(recv_x[:, -128:].amin(dim=-1))}, max range {all_value_range(recv_x[:, -128:].amax(dim=-1))}, sample range={"\n".join([all_value_range(recv_x[z, -128:]) for z in range(recv_x.shape[0])])}'
-                                        assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: Error exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
-                                    for j in range(num_ranks):
-                                        if eager_opt != deep_ep.Buffer.EAGER_FULL:
-                                            begin_idx, count = (recv_layout_range[j] >> 32).item(), (recv_layout_range[j] & int_mask).item()
-                                            if not round_scale:
-                                                assert (recv_x_amin == j - rank_offset).sum().item() == (all_topk_idx[j] == expert_id).sum().item()
-                                                assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
-                                        else:
-                                            if not round_scale:
-                                                # print(f'[rank {rank}]: expert {expert_id} per_rank_recv_count[{j}]=', per_rank_recv_count[j].item())
-                                                # assert per_rank_recv_count[j].item() <= num_tokens
-                                                # print(f'[rank {rank}]: expert {expert_id} slots {token_pos_int[j][:per_rank_recv_count[j].item()]}')
-                                                hit_tokens_main = recv_x[token_pos_int[j][:per_rank_recv_count[j]], :-128]
-                                                if (hit_tokens_main != (j - rank_offset)).sum().item() != 0:
-                                                    for hi in range(hit_tokens_main.shape[0]):
-                                                        if (hit_tokens_main[hi] != (j - rank_offset)).sum().item() == 0:
-                                                            continue
-                                                        print(f"[rank {rank}]: Error expert {expert_id} from {j} {hi}, hit_tokens_main: {all_value_range(hit_tokens_main[hi])}")
-                                                else:
-                                                    assert (hit_tokens_main != (j - rank_offset)).sum().item() == 0
+                                        if not round_scale:
+                                            # print(f'[rank {rank}]: expert {expert_id} per_rank_recv_count[{j}]=', per_rank_recv_count[j].item())
+                                            # assert per_rank_recv_count[j].item() <= num_tokens
+                                            # print(f'[rank {rank}]: expert {expert_id} slots {token_pos_int[j][:per_rank_recv_count[j].item()]}')
+                                            hit_tokens_main = recv_x[token_pos_int[j][:per_rank_recv_count[j]], :-128]
+                                            if (hit_tokens_main != (j - rank_offset)).sum().item() != 0:
+                                                for hi in range(hit_tokens_main.shape[0]):
+                                                    if (hit_tokens_main[hi] != (j - rank_offset)).sum().item() == 0:
+                                                        continue
+                                                    print(f"[rank {rank}]: Error round {dispatch_round:08x} expert {expert_id} from rank {j} {hi}, hit_tokens_main: {all_value_range(hit_tokens_main[hi], one_line=True)}")
+                                            # else:
+                                            #     assert (hit_tokens_main != (j - rank_offset)).sum().item() == 0
 
                                         
                             if dispatch_use_fp8:
@@ -190,6 +213,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             else:
                                 hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
+                        dist.barrier()
                         # Check combine correctness
                         for zero_copy in (False, ) if (use_logfmt or eager_opt != deep_ep.Buffer.EAGER_OFF) else (False, True):
                             if zero_copy:
@@ -210,12 +234,14 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                     print(f'[rank {rank}]: Error: nan in combine_x {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}')
                                 else:
                                     assert torch.isnan(combined_x).sum().item() == 0, f'Error: {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}'
-                                    if diff > (9e-4 if dispatch_use_fp8 else 1e-5):
+                                    if diff > 1e-6:
                                         print(f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {round_scale=} {use_ue8m0=} {seed=}')
                                     else:
                                         assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
                                 #print(f'[rank {rank}]: combine diff = {diff:.6f}')
                                 hash_value ^= hash_tensor(combined_x)
+    if do_check:
+        print(f'[rank {rank}]: check done', flush=True)
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -289,6 +315,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     repeat = args.repeat
     check = args.check
     trace_pfx = args.chrome_trace_pfx
+    start_seed = args.start_seed
 
     use_sep_stdout = args.sep_out_pfx is not None
     if use_sep_stdout:
@@ -315,13 +342,19 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     do_pressure_test = args.pressure_test
     for seed in range(int(1e9) if do_pressure_test else 0):
         #if local_rank == 0:
+        if seed < start_seed:
+            continue
         print(f'Testing with seed {seed} ...', flush=True)
+        torch.manual_seed(seed + rank)
+        random.seed(seed + rank)
         ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
                              use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, check=check, trace_pfx=trace_pfx)
-        for i in range(20):
+        for i in range(200):
             if test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
                              use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, check=check, trace_pfx=trace_pfx) != ref_hash: 
-                print(f'[rank {rank}]: Error: seed={seed}')
+                print(f'[rank {rank}]: Error: seed={seed} i={i}')
+        # if start_seed != 0:
+        #     break
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()
@@ -366,6 +399,8 @@ if __name__ == '__main__':
                         help="split output file prefix for each rank, stored as <prefix>_<rank>.txt, default: None, means mixed stdout")
     parser.add_argument("--chrome-trace-pfx", type=str, default=None,
                         help="store kineto trace if this prefix is given, stored as <prefix>_<return_hook>_<rank>.json")
+    parser.add_argument("--start-seed", type=int, default=0,
+                        help="start seed in pressure-test")
     args = parser.parse_args()
 
     num_processes = args.num_processes

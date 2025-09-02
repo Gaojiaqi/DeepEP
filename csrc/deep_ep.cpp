@@ -142,9 +142,9 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
-torch::Stream Buffer::get_comm_stream() const {
-    return comm_stream;
-}
+// torch::Stream Buffer::get_comm_stream() const {
+//     return comm_stream;
+// }
 
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
@@ -1302,6 +1302,9 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
+        // if ((phases & LOW_LATENCY_SEND_PHASE) != 0) {
+        //     CUDA_CHECK(cudaMemsetAsync(buffer.combine_rdma_recv_data_buffer, 0, num_experts * num_max_dispatch_tokens_per_rank * 14848, launch_stream));
+        // }
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
@@ -1405,7 +1408,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
-        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
