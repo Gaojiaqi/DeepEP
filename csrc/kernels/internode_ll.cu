@@ -372,7 +372,10 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             if (sub_warp_id == 1 && lane_id == 0) {
                 //st_release_cta(packed_recv_count + local_expert_idx, 0);
                 int cur_v = atomic_add_release_global(recv_cnt_barrier, 1);
-                st_release_cta(per_rank_recv_cnt_ptr, 0);
+                if (!normal_recv) {
+                    shared_num_recv_tokens[warp_group_id] == 0;
+                    st_release_cta(per_rank_recv_cnt_ptr, 0);
+                }
                 if (cur_v != num_ranks - 1) {
                     while (ld_acquire_global(recv_cnt_barrier) != 0);
                 } else {
@@ -431,7 +434,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             
             if constexpr (kEager == EAGER_FULL) {
                 if (!ld_intra_node) {
-                    WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node);
+                    WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node, sub_warp_id, shared_num_recv_tokens + warp_group_id);
                     __syncwarp();
                     num_recv_tokens = warp_reduce_min(num_recv_tokens);
                     
@@ -524,8 +527,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         //if constexpr (kEager == EAGER_FULL) if ((-num_recv_tokens-1) != 0 && sub_warp_id < num_max_dispatch_tokens_per_rank && lane_id == 0) printf("[rank %d]: dispatch recv token expert %d get %d tokens from rank %d, subwarp %d done\n", rank, global_expert_idx, (-num_recv_tokens-1), src_rank, sub_warp_id);
         
     }
-    cg::this_grid().sync();
-    if (sm_id == 0 && thread_id == 0) printf("[rank %d]: dispatch round 0x%08x recv done\n", rank, dispatch_round_n);
+    // cg::this_grid().sync();
+    // if (sm_id == 0 && thread_id == 0) printf("[rank %d]: dispatch round 0x%08x recv done\n", rank, dispatch_round_n);
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
@@ -824,8 +827,7 @@ combine(void* combined_x,
     constexpr int MAX_PAGES = MAX_PAGES_DIV4 << 2;
     EP_STATIC_ASSERT(MAX_PAGES_DIV4 <= 31, "pages can not be dealt by warp");
     EP_STATIC_ASSERT(kHidden * sizeof(nv_bfloat16) <= MAX_PAGES * PCIE_SEG_LEN, "hidden too large"); // max 4 page, 16K bytes, 8k bf16 hidden
-    int4 __tail_tags_int4[MAX_PAGES_DIV4 + 1];
-    __tail_tags_int4[MAX_PAGES_DIV4].x = ZTAG(combine_round_n);
+    int4 __tail_tags_int4[MAX_PAGES_DIV4];
     int *__tail_tags = reinterpret_cast<int*>(__tail_tags_int4); // store tag position values
 
     //constexpr int page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
@@ -1033,16 +1035,6 @@ combine(void* combined_x,
                 // Flush all stores
                 tma_store_wait();
                 __syncwarp();
-                // if constexpr (kEager_combine != EAGER_OFF) {
-                //     if (!intra_node && lane_id < 4) {
-                //         auto __check_ptr = lane_id < 3 ? (reinterpret_cast<uint8_t*>(cpy_dst_int4_ptr) + (PCIE_SEG_LEN - PCIE_TAIL_SZ) + (lane_id << PCIE_SEG_LEN_LOG)) : (reinterpret_cast<uint8_t*>(cpy_dst_int4_ptr) + long_msg_ext_len - sizeof(int4));
-                //         auto __check_ptr_int = reinterpret_cast<int*>(__check_ptr);
-                //         int __v;
-                //         if ((__v = ld_nc_global(__check_ptr_int)) != ZTAG(combine_round_n)) {
-                //             printf("[rank %d]: combine round 0x%08x expert %d send back rank %d token %d, offset %lu bytes, 0x%08x != 0x%08x\n", rank, combine_round_n, local_expert_idx + rank * num_local_experts, dst_rank, src_idx, PTR_DIFF(__check_ptr_int, cpy_dst_int4_ptr), __v, ZTAG(combine_round_n));
-                //         }
-                //     }
-                // }
             }
 
             // Issue RDMA
@@ -1214,14 +1206,14 @@ combine(void* combined_x,
                             //EP_DEVICE_ASSERT(reinterpret_cast<uint8_t*>(__check_ptr) - buffer + sizeof(int) <= msg_distance);
                             //int _value = ld_acquire_sys_global(__check_ptr);
                             //printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, init 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, reinterpret_cast<uint8_t*>(__check_ptr) - buffer, _value);
-                            int w_cnt = 0;
+                            //int w_cnt = 0;
                             int _value;
                             while ((_value = ld_acquire_sys_global(__check_ptr)) != ZTAG(combine_round_n)) {
-                                w_cnt += 1;
-                                if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
-                                if (w_cnt == FINAL_TIME_MASK) break;
+                                // w_cnt += 1;
+                                // if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
+                                // if (w_cnt == FINAL_TIME_MASK) break;
                             }
-                            *__check_ptr = 0;
+                            //*__check_ptr = 0;
                         }
                         __syncwarp();
                     }
@@ -1302,20 +1294,6 @@ combine(void* combined_x,
                 if constexpr (kEager_combine != EAGER_OFF) {
                     if (decode_warp_idx == 0 && lane_id < num_topk && topk_idx_by_lane >= 0) {
                         auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_by_lane * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance + short_msg_ext_len;
-                        //EP_DEVICE_ASSERT(PTR_DIFF(buffer, rdma_recv_x) < num_experts * num_max_dispatch_tokens_per_rank * msg_distance);
-                        // EP_DEVICE_ASSERT(topk_idx_by_lane < num_experts);
-                        // EP_DEVICE_ASSERT(token_idx < num_max_dispatch_tokens_per_rank);
-                        // EP_DEVICE_ASSERT(short_msg_ext_len < msg_distance);
-                        // printf("(%d * %d + %d) * %d + %d = %d\n", 
-                        //     topk_idx_by_lane, 
-                        //     num_max_dispatch_tokens_per_rank, 
-                        //     token_idx, 
-                        //     msg_distance, 
-                        //     short_msg_ext_len, 
-                        //     (topk_idx_by_lane * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance + short_msg_ext_len);
-                        // printf("topk %d token_idx %d smsgextlen %d\n", topk_idx_by_lane, token_idx, short_msg_ext_len);
-                        // EP_DEVICE_ASSERT((topk_idx_by_lane * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance + short_msg_ext_len < num_experts * num_max_dispatch_tokens_per_rank * msg_distance);
-                        // EP_DEVICE_ASSERT(PTR_DIFF(buffer, rdma_recv_x) < num_experts * num_max_dispatch_tokens_per_rank * msg_distance);
                         const auto intra_node = ((topk_idx_by_lane / num_local_experts) >> 3) == (rank >> 3);
                         if (!intra_node) {
                             *reinterpret_cast<int*>(buffer) = 0; // reset short message tail tag
@@ -1367,8 +1345,8 @@ combine(void* combined_x,
             }
         }
     }
-    cg::this_grid().sync();
-    if (sm_id == 0 && thread_id == 0) printf("[rank %d]: combine round 0x%08x recv done\n", rank, combine_round_n);
+    // cg::this_grid().sync();
+    // if (sm_id == 0 && thread_id == 0) printf("[rank %d]: combine round 0x%08x recv done\n", rank, combine_round_n);
 }
 
 void combine(void* combined_x,

@@ -173,7 +173,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 #define CHECK_TIME_MASK 0xffffff
 #define FINAL_TIME_MASK 0x10000000
 
-#define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, intra_node) {\
+#define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, intra_node, warp_id, count_cache_ptr) {\
     int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
         int ld_value;\
@@ -187,8 +187,13 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
                 break;\
             }\
             if (count_value == 0) {\
-                count_value = ld_acquire_sys_global(count_ptr);\
-                count_value = ((count_value & 0xffff0000) == SHORT_TAG(tagv)) ? (count_value | 0xffff0000) : 0;\
+                if (warp_id == 0) {\
+                    count_value = ld_acquire_sys_global(count_ptr);\
+                    count_value = ((count_value & 0xffff0000) == SHORT_TAG(tagv)) ? (count_value | 0xffff0000) : 0;\
+                    if (count_value != 0) st_release_cta(count_cache_ptr, count_value);\
+                } else {\
+                    count_value = ld_acquire_cta(count_cache_ptr);\
+                }\
                 if (count_value != 0 && token_idx >= (-count_value-1)) {\
                     break;\
                 }\
