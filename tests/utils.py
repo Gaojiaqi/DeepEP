@@ -197,14 +197,10 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
         for line in prof_lines:
             if name in line:
                 time_str = line.split()[-2]
-                unit_hit = False
                 for unit, scale in units.items():
                     if unit in time_str:
                         kernel_durations.append(float(time_str.replace(unit, '')) / scale)
-                        unit_hit = True
                         break
-                if not unit_hit:
-                    print(f'unknown unit: {time_str}')
                 break
 
     # Expand the kernels by periods
@@ -230,3 +226,58 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
 
 def hash_tensor(t: torch.Tensor):
     return t.view(torch.int).sum().item()
+
+
+def split_range(tensor : torch.Tensor, values : set):
+    r = {v : [] for v in values}
+    cur_v = None
+    cur_start = None
+    for i in range(tensor.shape[0]):
+        if cur_v is None:
+            cur_v = tensor[i].item()
+            cur_start = i
+        elif (np.isnan(cur_v) and np.isnan(tensor[i].item())) or cur_v == tensor[i].item():
+            continue
+        else:
+            r[cur_v].append(f'{cur_start}, {i}')
+            cur_v = tensor[i].item()
+            cur_start = i
+    r[cur_v].append(f'{cur_start}, {tensor.shape[0]}')
+    return r
+
+def all_value_range(tensor : torch.Tensor, except_zero : bool = False, one_line = False):
+    fvalues = list(tensor.float().cpu().numpy())
+    values = set([v for v in fvalues if not np.isnan(v)])
+    hasnan = any([np.isnan(v) for v in fvalues])
+    if hasnan:
+        values.add(torch.nan)
+    if except_zero:
+        values.remove(0)
+    d = split_range(tensor=tensor, values=values)
+    if one_line:
+        return json.dumps({str(v): r for v, r in d.items()})
+    else:
+        return '\n' + json.dumps({str(v): r for v, r in d.items()}, indent=4) + '\n'
+
+def dump_nan_tensors(tensor : torch.Tensor):
+    r = []
+    for i in range(tensor.shape[0]):
+        if torch.isnan(tensor[i]).sum().cpu().item() != 0:
+            r.append((i, all_value_range(torch.isnan(tensor[i]), except_zero=True)))
+    return '\n'.join([str(x) for x in r])
+
+def all_value_range_m(tensors: torch.Tensor, except_zero : bool = False, one_line = False):
+    sep = ' ' if one_line else '\n'
+    return sep.join([all_value_range(tensors[i], except_zero=except_zero, one_line=one_line) for i in range(tensors.shape[0])])
+
+def non_same_tensor_layout(tensor: torch.Tensor):
+    not_same_bitmap = tensor.amax(dim=-1) != tensor.amin(dim=-1)
+    not_same_idx = [i for i in range(not_same_bitmap.shape[0]) if not_same_bitmap[i]]
+    diff_tensors = tensor[not_same_bitmap]
+    return f'diff index: {not_same_idx}, diff tensor layout: {all_value_range_m(diff_tensors, one_line=True)}'
+
+def non_same_2tensor_layout(tensor1: torch.Tensor, tensor2: torch.Tensor):
+    not_same_bitmap = tensor1 != tensor2
+    not_same_idx = [i for i in range(not_same_bitmap.shape[0]) if not_same_bitmap[i]]
+    return f'diff index: {not_same_idx}, tensor1 layout: {list(tensor1[not_same_idx].float().cpu().numpy())}, tensor2 layout: {list(tensor2[not_same_idx].float().cpu().numpy())}'
+

@@ -648,6 +648,12 @@ class Buffer:
         if not self.eager_support and eager_opt != self.EAGER_OFF:
             print('WARN: eager_opt != EAGER_OFF is not supported when eager_support is not enabled, fallback to EAGER_OFF.')
             eager_opt = self.EAGER_OFF
+        if self.eager_support and use_logfmt:
+            print('WARN: buffer can not use logfmt feature if eager support is on.')
+            use_logfmt = False
+        if self.eager_support and zero_copy:
+            print('WARN: buffer can not use zero_copy feature if eager support is on.')
+            zero_copy = False
         src_info, layout_range, num_max_dispatch_tokens_per_rank, per_rank_recv_count, hidden, num_experts = handle
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, per_rank_recv_count, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats,

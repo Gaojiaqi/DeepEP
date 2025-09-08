@@ -9,86 +9,13 @@ from functools import partial
 from typing import Optional
 
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back, non_same_tensor_layout, non_same_2tensor_layout, all_value_range, dump_nan_tensors
 
-def eq_range(tensor : torch.Tensor, value : float):
-    ranges = []
-    last_eq = -2
-    eq_start = None
-    for i in range(tensor.shape[0]):
-        if (np.isnan(value) and torch.isnan(tensor[i]).item()) or ((not np.isnan(value)) and tensor[i] == value):
-            if last_eq != i - 1:
-                eq_start = i
-            last_eq = i
-        else:
-            if last_eq == i - 1:
-                ranges.append([eq_start, i])
-    if last_eq == tensor.shape[0] - 1:
-        ranges.append([eq_start, tensor.shape[0]])
-    return ranges
-
-def split_range(tensor : torch.Tensor, values : set):
-    r = {v : [] for v in values}
-    cur_v = None
-    cur_start = None
-    for i in range(tensor.shape[0]):
-        if cur_v is None:
-            cur_v = tensor[i].item()
-            cur_start = i
-        elif (np.isnan(cur_v) and np.isnan(tensor[i].item())) or cur_v == tensor[i].item():
-            continue
-        else:
-            r[cur_v].append(f'{cur_start}, {i}')
-            cur_v = tensor[i].item()
-            cur_start = i
-    r[cur_v].append(f'{cur_start}, {tensor.shape[0]}')
-    return r
-
-import json
-def all_value_range(tensor : torch.Tensor, except_zero : bool = False, one_line = False):
-    fvalues = list(tensor.float().cpu().numpy())
-    values = set([v for v in fvalues if not np.isnan(v)])
-    hasnan = any([np.isnan(v) for v in fvalues])
-    if hasnan:
-        values.add(torch.nan)
-    if except_zero:
-        values.remove(0)
-    d = split_range(tensor=tensor, values=values)
-    if one_line:
-        return json.dumps({str(v): r for v, r in d.items()})
-    else:
-        return '\n' + json.dumps({str(v): r for v, r in d.items()}, indent=4) + '\n'
-
-def dump_nan_tensors(tensor : torch.Tensor):
-    r = []
-    for i in range(tensor.shape[0]):
-        if torch.isnan(tensor[i]).sum().cpu().item() != 0:
-            r.append((i, all_value_range(torch.isnan(tensor[i]), except_zero=True)))
-    return '\n'.join([str(x) for x in r])
-
-def all_value_range_m(tensors: torch.Tensor, except_zero : bool = False, one_line = False):
-    sep = ' ' if one_line else '\n'
-    return sep.join([all_value_range(tensors[i], except_zero=except_zero, one_line=one_line) for i in range(tensors.shape[0])])
-
-def non_same_tensor_layout(tensor: torch.Tensor):
-    not_same_bitmap = tensor.amax(dim=-1) != tensor.amin(dim=-1)
-    not_same_idx = [i for i in range(not_same_bitmap.shape[0]) if not_same_bitmap[i]]
-    diff_tensors = tensor[not_same_bitmap]
-    return f'diff index: {not_same_idx}, diff tensor layout: {all_value_range_m(diff_tensors, one_line=True)}'
-
-def non_same_2tensor_layout(tensor1: torch.Tensor, tensor2: torch.Tensor):
-    not_same_bitmap = tensor1 != tensor2
-    not_same_idx = [i for i in range(not_same_bitmap.shape[0]) if not_same_bitmap[i]]
-    return f'diff index: {not_same_idx}, tensor1 layout: {list(tensor1[not_same_idx].float().cpu().numpy())}, tensor2 layout: {list(tensor2[not_same_idx].float().cpu().numpy())}'
-
-
-dispatch_round = 0x40000000
-combine_round = 0xc0000000
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: deep_ep.Buffer,
               use_logfmt: bool = False, seed: int = 0, eager_opt: int = 1, repeat: int = 1, check : int = 1, trace_pfx : str = None):
-    # torch.manual_seed(seed + rank)
-    # random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
+    random.seed(seed + rank)
 
     assert num_experts % num_ranks == 0
     num_local_experts = num_experts // num_ranks
@@ -105,32 +32,26 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.5 * random.random())
     # NOTES: the last one is for performance testing
     # Most of the values in the perf case is lower than the threshold, casting most channels
-    # x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
-    #x_list = x_list[1:]
+    x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
 
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
-    #topk_idx = torch.stack([(torch.arange(num_topk) + i + num_experts // num_ranks * rank) % num_experts for i in range(num_tokens)]).cuda()
-    #topk_idx = torch.stack([(torch.arange(num_topk) + num_experts - num_topk) % num_experts for i in range(num_tokens)]).cuda()
-    #topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') / num_topk
+    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
 
     # Randomly mask some positions
     for i in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
-    global dispatch_round, combine_round
     # Check dispatch correctness
     do_check = check > 0
     hash_value, num_times = 0, 0
     for current_x in x_list:
         for return_recv_hook in (False, True):
-            for dispatch_use_fp8 in (False, ):
-                for round_scale in (False, ) if dispatch_use_fp8 else (False, ):
+            for dispatch_use_fp8 in (False, True):
+                for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
-                            #print(f'[rank {rank}]: dispatch func {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {return_recv_hook=}, round={i}/{num_times % 2 + 1}, cnt=0x{dispatch_round:x}', flush=True)
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
@@ -138,7 +59,6 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                                             async_finish=not return_recv_hook, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
                             hook() if return_recv_hook else event.current_stream_wait()
-                            dispatch_round += 1
                         packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
                         simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                             if dispatch_use_fp8 else packed_recv_x.clone()
@@ -171,21 +91,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 recv_x = recv_x[:num_valid_tokens]
                                 recv_x_amin = recv_x[:, :-128].amin(dim=-1)
                                 recv_src_info = recv_src_info[:num_valid_tokens]
-                                if not torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)):
-                                    print(f'[rank {rank}]: Error round {dispatch_round:08x} expert {expert_id} token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {non_same_tensor_layout(recv_x[:, :-128])}')
-                                #else:
-                                    #assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, max range={all_value_range(recv_x[:, :-128].amax(dim=-1))}, min range={all_value_range(recv_x_amin)}, sample range={"\n".join([all_value_range(recv_x[z, :-128]) for z in range(recv_x.shape[0])])}'
+                                assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1)), f'[rank {rank}]: Error expert {expert_id} token first part not consistent, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {non_same_tensor_layout(recv_x[:, :-128])}'
+                                
                                 if round_scale:
-                                    if calc_diff(recv_x[:, -1], recv_src_info.view(-1)) >= 0.007:
-                                        print(f'[rank {rank}]: Error round {dispatch_round:08x} expert {expert_id} src info != recv_x second part, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {non_same_2tensor_layout(recv_x[:,-1], recv_src_info.view(-1))}')
-                                    # else:
-                                    #     assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
+                                    assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007, f'[rank {rank}]: Error expert {expert_id} src info != recv_x second part, {dispatch_use_fp8=}, {round_scale=}, {use_ue8m0=}, {non_same_2tensor_layout(recv_x[:,-1], recv_src_info.view(-1))}'
                                 else:
-                                    if not torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)):
-                                        print(f'[rank {rank}]: round {dispatch_round:08x} Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part {non_same_tensor_layout(recv_x[:, -128:])}')
-                                    if not torch.equal(recv_x[:, -1], recv_src_info.view(-1)):
-                                        print(f'[rank {rank}]: round {dispatch_round:08x} Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part != src info, {non_same_2tensor_layout(recv_x[:, -1], recv_src_info.view(-1))}')
-                                    #assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0, f'[rank {rank}]: Error exp {expert_id}, xrange: {all_value_range(recv_x[:, -128])} src_info: {all_value_range(recv_src_info)}'
+                                    assert torch.equal(recv_x[:, -128:].amin(dim=-1), recv_x[:, -128:].amax(dim=-1)), f'[rank {rank}]: Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part {non_same_tensor_layout(recv_x[:, -128:])}'
+                                    assert torch.equal(recv_x[:, -1], recv_src_info.view(-1)), f'[rank {rank}]: Error {dispatch_use_fp8=} exp {expert_id}, {num_valid_tokens} tokens, token second part != src info, {non_same_2tensor_layout(recv_x[:, -1], recv_src_info.view(-1))}'
                                 for j in range(num_ranks):
                                     if eager_opt != deep_ep.Buffer.EAGER_FULL:
                                         begin_idx, count = (recv_layout_range[j] >> 32).item(), (recv_layout_range[j] & int_mask).item()
@@ -194,18 +106,10 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                             assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
                                     else:
                                         if not round_scale:
-                                            # print(f'[rank {rank}]: expert {expert_id} per_rank_recv_count[{j}]=', per_rank_recv_count[j].item())
-                                            # assert per_rank_recv_count[j].item() <= num_tokens
-                                            # print(f'[rank {rank}]: expert {expert_id} slots {token_pos_int[j][:per_rank_recv_count[j].item()]}')
                                             hit_tokens_main = recv_x[token_pos_int[j][:per_rank_recv_count[j]], :-128]
                                             if (hit_tokens_main != (j - rank_offset)).sum().item() != 0:
                                                 for hi in range(hit_tokens_main.shape[0]):
-                                                    if (hit_tokens_main[hi] != (j - rank_offset)).sum().item() == 0:
-                                                        continue
-                                                    print(f"[rank {rank}]: Error round {dispatch_round:08x} expert {expert_id} from rank {j} {hi}, hit_tokens_main: {all_value_range(hit_tokens_main[hi], one_line=True)}")
-                                            # else:
-                                            #     assert (hit_tokens_main != (j - rank_offset)).sum().item() == 0
-
+                                                    assert (hit_tokens_main[hi] != (j - rank_offset)).sum().item() == 0, f"[rank {rank}]: Error expert {expert_id} from rank {j} {hi}, hit_tokens_main: {all_value_range(hit_tokens_main[hi], one_line=True)}"
                                         
                             if dispatch_use_fp8:
                                 hash_value ^= hash_tensor(packed_recv_x[0][i, :num_valid_tokens])
@@ -213,35 +117,22 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             else:
                                 hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
-                        dist.barrier()
                         # Check combine correctness
-                        for zero_copy in (False, ) if (use_logfmt or eager_opt != deep_ep.Buffer.EAGER_OFF) else (False, True):
+                        for zero_copy in (False, ) if use_logfmt else (False, True):
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                            #print(f'[rank {rank}]: combine {dispatch_use_fp8=} {return_recv_hook=} {round_scale=} {use_ue8m0=} {use_logfmt=} {zero_copy=} cnt=0x{combine_round:x}', flush=True)
                             combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                                                 use_logfmt=use_logfmt,
                                                                                 async_finish=not return_recv_hook, zero_copy=zero_copy,
                                                                                 return_recv_hook=return_recv_hook, eager_opt=eager_opt, out=out)
-                            #print(f'[rank {rank}]: combine done') if rank == 0 else None
+
                             hook() if return_recv_hook else event.current_stream_wait()
-                            #print(f'[rank {rank}]: hook done') if rank == 0 else None
-                            combine_round += 1
                             if do_check:
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
-                                if torch.isnan(combined_x).sum().item() != 0:
-                                    print(f'[rank {rank}]: Error: nan in combine_x {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}')
-                                else:
-                                    assert torch.isnan(combined_x).sum().item() == 0, f'Error: {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}'
-                                    if diff > 1e-6:
-                                        print(f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {round_scale=} {use_ue8m0=} {seed=}')
-                                    else:
-                                        assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
-                                #print(f'[rank {rank}]: combine diff = {diff:.6f}')
+                                assert torch.isnan(combined_x).sum().item() == 0, f'[rank {rank}]: Error: nan in combine_x {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}'
+                                assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {round_scale=} {use_ue8m0=} {seed=}'
                                 hash_value ^= hash_tensor(combined_x)
-    if do_check:
-        print(f'[rank {rank}]: check done', flush=True)
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -252,26 +143,14 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
-        #global dispatch_round, combine_round
-        #print(f'[rank {rank}]: test dispatch begin', flush=True)
-        #print(f'[rank {rank}]: dispatch func bench, {return_recv_hook=}, cnt=0x{dispatch_round:x}', flush=True)
         recv_x, recv_count, handle, event, hook = \
             buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                         use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
         large_gemm_with_hook(hook) if return_recv_hook else None
-        #print(f'[rank {rank}]: test combine begin', flush=True)
-        #print(f'[rank {rank}]: combine func bench, {return_recv_hook=}, cnt=0x{combine_round:x}', flush=True)
-        #dist.barrier()
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook, eager_opt=eager_opt)
         large_gemm_with_hook(hook) if return_recv_hook else None
-        #dist.barrier()
-        #print(f'[rank {rank}]: combine bench done, {return_recv_hook=}, cnt=0x{combine_round:x}', flush=True)
-        #dispatch_round += 1
-        #combine_round += 1
-        #print(f'[rank {rank}]: test combine end', flush=True) 
-        #dist.barrier()
 
     # Calculate bandwidth
     num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
@@ -341,10 +220,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     do_pressure_test = args.pressure_test
     for seed in range(int(1e9) if do_pressure_test else 0):
-        #if local_rank == 0:
         if seed < start_seed:
             continue
-        print(f'Testing with seed {seed} ...', flush=True)
+        if local_rank == 0:
+            print(f'Testing with seed {seed} ...', flush=True)
         torch.manual_seed(seed + rank)
         random.seed(seed + rank)
         ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
@@ -353,8 +232,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
                              use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, check=check, trace_pfx=trace_pfx) != ref_hash: 
                 print(f'[rank {rank}]: Error: seed={seed} i={i}')
-        # if start_seed != 0:
-        #     break
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()

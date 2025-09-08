@@ -142,9 +142,9 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
-// torch::Stream Buffer::get_comm_stream() const {
-//     return comm_stream;
-// }
+torch::Stream Buffer::get_comm_stream() const {
+    return comm_stream;
+}
 
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
@@ -231,7 +231,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
 
         // Allocate
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
-        //printf("alloc %lu bytes for RDMA\n", num_rdma_bytes);
+
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
@@ -1133,6 +1133,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -1140,13 +1141,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
-
-    const auto recv_buffer_size = num_experts * num_max_dispatch_tokens_per_rank * 14848;
-    EP_HOST_ASSERT(layout.buffers[1].dispatch_rdma_recv_data_buffer = layout.buffers[1].combine_rdma_recv_data_buffer);
-    EP_HOST_ASSERT(layout.buffers[0].dispatch_rdma_recv_data_buffer = layout.buffers[0].combine_rdma_recv_data_buffer);
-    EP_HOST_ASSERT(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) - reinterpret_cast<uint8_t*>(layout.buffers[0].dispatch_rdma_recv_data_buffer) == recv_buffer_size);
-    
-    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) + recv_buffer_size - sizeof(int), 0, sizeof(int), launch_stream));
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
@@ -1199,7 +1193,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {
         ll_dispatch_round_n = ((ll_dispatch_round_n + 1) & ROUND_MASK) | DISPATCH_ROUND_INT;
-        //printf("[rank %d]: dispatch round updated to 0x%x\n", rank, ll_dispatch_round_n);
     }
     // Wait streams
     std::optional<EventHandle> event;
@@ -1217,7 +1210,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         recv_hook = [=]() { 
             launcher(LOW_LATENCY_RECV_PHASE);
             ll_dispatch_round_n = ((ll_dispatch_round_n + 1) & ROUND_MASK) | DISPATCH_ROUND_INT; 
-            //printf("[rank %d]: dispatch round updated to 0x%x\n", rank, ll_dispatch_round_n);
         };
 
     // Return values
@@ -1281,13 +1273,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
-    const auto recv_buffer_size = num_experts * num_max_dispatch_tokens_per_rank * 14848;
-    EP_HOST_ASSERT(layout.buffers[1].dispatch_rdma_recv_data_buffer = layout.buffers[1].combine_rdma_recv_data_buffer);
-    EP_HOST_ASSERT(layout.buffers[0].dispatch_rdma_recv_data_buffer = layout.buffers[0].combine_rdma_recv_data_buffer);
-    EP_HOST_ASSERT(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) - reinterpret_cast<uint8_t*>(layout.buffers[0].dispatch_rdma_recv_data_buffer) == recv_buffer_size);
-    
-    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<uint8_t*>(layout.buffers[1].dispatch_rdma_recv_data_buffer) + recv_buffer_size - sizeof(int), 0, sizeof(int), launch_stream));
-
     // Allocate output tensor
     torch::Tensor combined_x;
     if (out.has_value()) {
@@ -1302,9 +1287,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
-        // if ((phases & LOW_LATENCY_SEND_PHASE) != 0) {
-        //     CUDA_CHECK(cudaMemsetAsync(buffer.combine_rdma_recv_data_buffer, 0, num_experts * num_max_dispatch_tokens_per_rank * 14848, launch_stream));
-        // }
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
@@ -1322,7 +1304,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {
         ll_combine_round_n = ((ll_combine_round_n + 1) & ROUND_MASK) | COMBINE_ROUND_INT;
-        //printf("[rank %d]: combine round updated to 0x%x\n", rank, ll_combine_round_n);
     }
 
     // Wait streams
@@ -1341,7 +1322,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
         recv_hook = [=]() { 
             launcher(LOW_LATENCY_RECV_PHASE); 
             ll_combine_round_n = ((ll_combine_round_n + 1) & ROUND_MASK) | COMBINE_ROUND_INT;
-            //printf("[rank %d]: combine round updated to 0x%x\n", rank, ll_combine_round_n);
         };
 
     // Return values
@@ -1408,6 +1388,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)

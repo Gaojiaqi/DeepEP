@@ -101,27 +101,19 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 }
 
 
-
-#define TAG_V_OFFSET 0
-
-/**
- * 
- * Phase 3: auto tagging
- */
-
 // x < 1048576 approximation
 #define DIV255(x) (((x) * 0x8081U) >> 23)
 #define DIV4080(x) DIV255((x) >> 4)
 
-//#define SHIFTED_ADDR(a) (a + ((a) / (PCIE_SEG_LEN - PCIE_TAIL_SZ)) * PCIE_TAIL_SZ)
+
 #define SHIFTED_ADDR(a) ((a) + (DIV4080(a) * PCIE_TAIL_SZ))
 #define PTR_DIFF(a, b) (reinterpret_cast<uint8_t*>(a) - reinterpret_cast<uint8_t*>(b))
-//#define SHIFTED_ADDR_P(ptr, bptr) (ptr + ((PTR_DIFF(ptr, bptr) / (PCIE_SEG_LEN - PCIE_TAIL_SZ))) * PCIE_TAIL_SZ / sizeof(*(ptr)))
 #define SHIFTED_ADDR_P(ptr, bptr) ((ptr) + DIV4080(PTR_DIFF(ptr, bptr)) * PCIE_TAIL_SZ / sizeof(*(ptr)))
 #define IS_PAGE_SUB_HEAD(ptr, bptr, size) (((PTR_DIFF(ptr, bptr) == (size)) || (PTR_DIFF(ptr, bptr) % (PCIE_SEG_LEN - PCIE_TAIL_SZ)) == 0))
 #define CHK_POSITION(bptr, ext_size, pn, ptotal) (reinterpret_cast<uint8_t*>(bptr) + ((pn == ptotal - 1) ? (ext_size - PCIE_TAIL_SZ) : (((pn) << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ))))
 #define EXT_PAGE_N(size) ((size >> PCIE_SEG_LEN_LOG) + ((size & PCIE_SEG_LEN_MASK) != 0))
 
+#define TAG_V_OFFSET 0
 #define ZTAG(tag) (tag + TAG_V_OFFSET)
 #define TAG_CNT_MASK 0x3fffffff
 #define TAG_TYPE(tag) ((tag >> 31) & 1)
@@ -131,17 +123,8 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     const int __pages = EXT_PAGE_N(ext_len);\
     for (int __pn = exec_id; __pn < __pages; __pn += exec_total) {\
         int *__check_ptr = reinterpret_cast<int*>(CHK_POSITION(send_buf, ext_len, __pn, __pages));\
-        /*printf("[rank %d]: dispatch round 0x%08x token %d st tag 0x%08x at offset %lu\n", rank, dispatch_round_n, token_idx, ZTAG(tagv), PTR_DIFF(__check_ptr, send_buf))*/;\
-        /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(__check_ptr) % sizeof(int) == 0)*/;\
         st_func(__check_ptr, ZTAG(tagv));\
     }\
-}
-
-#define WARP_SET_TAIL_TAG(dst_buf, len, tagv) if constexpr (kEager != EAGER_OFF) {\
-    __syncwarp();\
-    /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(dst_buf + len) % sizeof(int) == 0)*/;\
-    lane_id == 0 ? st_release_sys_global(reinterpret_cast<int*>(dst_buf + len), ZTAG(tagv)) : void(0);\
-    /*if (lane_id == 0) printf("[rank %d]: dispatch round 0x%08x token %d st tail tag 0x%08x at offset %lu\n", rank, dispatch_round_n, token_idx, ZTAG(tagv), len)*/;\
 }
 
 #define WAIT_BIT(recv_buf, ext_len, exec_id, exec_total, tagv, intra_node) {\
@@ -149,23 +132,9 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     for (int target = exec_id; target < __page_n; target += exec_total) {\
         int ld_value;\
         int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n));\
-        /*EP_DEVICE_ASSERT(reinterpret_cast<uint64_t>(_check_ptr) % sizeof(int) == 0)*/;\
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\
             if (ld_value == ZTAG(tagv)) break;\
-        }\
-    }\
-}
-
-#define TRY_BIT(recv_buf, ext_len, exec_id, exec_total, tagv, ready, intra_node) {\
-    int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
-    for (int target = exec_id; target < __page_n; target += exec_total) {\
-        int ld_value;\
-        int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n));\
-        ld_value = ld_acquire_sys_global(_check_ptr);\
-        if (ld_value == ZTAG(tagv)) {\
-            ready = 0;\
-            break;\
         }\
     }\
 }
@@ -177,13 +146,10 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
         int ld_value;\
-        /*int w_cnt = 0*/;\
         int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n)) ;\
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\
             if (ld_value == ZTAG(tagv)) {\
-                /*printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d get expected tag 0x%08x at offset: %lu\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, ld_value, PTR_DIFF(_check_ptr, recv_buf))*/;\
-                _check_ptr = 0;\
                 break;\
             }\
             if (count_value == 0) {\
@@ -198,35 +164,13 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
                     break;\
                 }\
             }\
-            /*w_cnt += 1;\
-            if ((w_cnt & CHECK_TIME_MASK) == 0) printf("[rank %d]: dispatch round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu (abs %lu) for %d times, 0x%08x != 0x%08x, cnt = %d(%d)\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), PTR_DIFF(_check_ptr, rdma_recv_x), w_cnt, ld_value, ZTAG(tagv), count_value, -count_value-1);\
-            if (w_cnt == FINAL_TIME_MASK) break*/;\
+            w_cnt += 1;\
+            if (w_cnt == FINAL_TIME_MASK) {\
+                printf("[rank %d]: [EAGER DISPATCH HANG] dispatch round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu for %d times, 0x%08x != 0x%08x, cnt = %d(%d)\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv), count_value, -count_value-1);\
+                break;\
+            }\
         };\
     }\
-}
-
-#define TRY_2BIT(recv_buf, len, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, ready, token_idx, intra_node) {\
-    int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
-    if (exec_id == 0 && count_value == 0) {\
-        count_value = ld_acquire_sys_global(count_ptr);\
-        if ((count_value & 0xffff0000) == SHORT_TAG(tagv)) {\
-            count_value = (count_value | 0xffff0000);\
-        } else {\
-            /*printf("[rank %d]: expert %d from %d, cnt tag mismatch, 0x%x != 0x%x\n", rank, global_expert_idx, src_rank, (count_value >> 16) & 0xffff, (tagv % 0xffff) + 1)*/;\
-            count_value = 0;\
-        }\
-    }\
-    __syncwarp();\
-    for (int target = exec_id; target < __page_n; target += exec_total) {\
-        int ld_value;\
-        int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, len, target, __page_n));\
-        ld_value = ld_acquire_sys_global(_check_ptr);\
-        if (ld_value != ZTAG(tagv)) {\
-            ready = 0;\
-            break;\
-        }\
-    }\
-    __syncwarp();\
 }
 
 #define NORMAL_ST(PTR, VALUE) *(PTR) = VALUE
@@ -280,24 +224,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define INT_VALUE_NO_NAN(value) {\
-    int __value = value;\
-    nv_bfloat16 *__bf16_ptr = reinterpret_cast<nv_bfloat16*>(&__value);\
-    EP_DEVICE_ASSERT(!isnan(static_cast<float>(__bf16_ptr[0])));\
-    EP_DEVICE_ASSERT(!isnan(static_cast<float>(__bf16_ptr[1])));\
-}
-
-#define INT4_VALUE_NO_NAN(value) {\
-    int4 __value = value;\
-    nv_bfloat16 *__bf16_ptr = reinterpret_cast<nv_bfloat16*>(&__value);\
-    for (int __u = 0; __u < 8; ++__u) {\
-        EP_DEVICE_ASSERT(!isnan(static_cast<float>(__bf16_ptr[__u])));\
-    }\
-}
-
-
 #define TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, gmem_base, tag_save, tagv, kparam, intra_node) {\
-    /*printf("[rank %d]: debug: modifying smem\n", rank)*/;\
     if (!intra_node) {\
         const auto diff = PTR_DIFF(gmem_ptr, gmem_base);\
         int __BASE_PN__ = diff >> PCIE_SEG_LEN_LOG;\
@@ -305,8 +232,6 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
         if (lane_id == 0 && __BASE_PN__ != __TAIL_PN__) {\
             int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
             tag_save[__BASE_PN__] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
-            /*printf("[rank %d]: exp %d send back rank %d token %d, insert middle tags, offset %lu, store 0x%08x at %d\n", rank, global_expert_idx, dst_rank, src_idx, tag_tma_offset + diff, tag_save[__BASE_PN__], __BASE_PN__)*/;\
-            /*INT_VALUE_NO_NAN(tag_save[__BASE_PN__])*/;\
             st_release_cta(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset), ZTAG(tagv));\
         }\
     }\

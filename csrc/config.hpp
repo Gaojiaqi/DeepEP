@@ -145,7 +145,6 @@ struct LowLatencyLayout {
         if (eager_support) {
             num_bytes_per_dispatch_msg = EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_dispatch_msg + sizeof(int) * 4, AR_MSG_LONG_ALIGNMENT);
             num_bytes_per_combine_msg = EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_combine_msg + sizeof(int) * 4, AR_MSG_LONG_ALIGNMENT);
-            //printf("extended msg len: %lu, %lu\n", num_bytes_per_dispatch_msg, num_bytes_per_combine_msg);
         }
 
         // Send buffer
@@ -160,7 +159,6 @@ struct LowLatencyLayout {
         size_t dispatch_recv_data_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
         size_t combine_recv_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
         size_t recv_buffer_bytes = std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
-        //printf("recv buffer bytes: %lu\n", recv_buffer_bytes);
         EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
         total_bytes += recv_buffer_bytes * 2;
 
