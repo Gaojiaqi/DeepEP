@@ -145,7 +145,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 #define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, intra_node, warp_id, count_cache_ptr) {\
     int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
-        int ld_value;\
+        int ld_value, w_cnt;\
         int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n)) ;\
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\

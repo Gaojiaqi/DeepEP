@@ -92,7 +92,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     constexpr size_t short_msg_final_tag = SHIFTED_ADDR(short_msg_len);
 
     constexpr size_t scale_ldst_offset = sizeof(int4) * (kHidden == 8192 ? 2 : (kHidden < 4096 ? 0 : 1));
-    constexpr size_t scale_ldst_float_offset = kEager != EAGER_OFF ? (scale_st_offset / sizeof(float)) : 0;
+    constexpr size_t scale_ldst_float_offset = kEager != EAGER_OFF ? (scale_ldst_offset / sizeof(float)) : 0;
 
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
@@ -341,7 +341,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             if (sub_warp_id == 1 && lane_id == 0) {
                 int cur_v = atomic_add_release_global(recv_cnt_barrier, 1);
                 if (!normal_recv) {
-                    shared_num_recv_tokens[warp_group_id] == 0;
+                    shared_num_recv_tokens[warp_group_id] = 0;
                     st_release_cta(per_rank_recv_cnt_ptr, 0);
                 }
                 if (cur_v != num_ranks - 1) {
