@@ -130,17 +130,17 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define WAIT_BIT(recv_buf, ext_len, exec_id, exec_total, tagv, kernel_name) {\
+#define WAIT_BIT(recv_buf, ext_len, exec_id, exec_total, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name) {\
     int __page_n = EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
         int ld_value, w_cnt;\
-        int* _check_ptr = reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n));\
+        int* __check_ptr = reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n));\
         while (true) {\
-            ld_value = ld_acquire_sys_global(_check_ptr);\
+            ld_value = ld_acquire_sys_global(__check_ptr);\
             if (ld_value == ZTAG(tagv)) break;\
             w_cnt += 1;\
             if (w_cnt == FINAL_TIME_MASK) {\
-                printf("[rank %d]: [EAGER " kernel_name " HANG] combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, tagv, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, recv_buf), w_cnt, _value, ZTAG(tagv));
+                printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x token %d topk %d from/to exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, PTR_DIFF(__check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv));\
                 break;\
             }\
         }\

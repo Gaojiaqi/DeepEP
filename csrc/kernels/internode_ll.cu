@@ -417,7 +417,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     }
                 }
             } else if constexpr (kEager != EAGER_OFF) {
-                WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, "DISPATCH");
+                WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, i, -1, local_expert_idx + rank * num_local_experts, rank, "DISPATCH");
             }
             
             if constexpr (kEager != EAGER_FULL) {
@@ -922,7 +922,7 @@ combine(void* combined_x,
                         tma_store_1d(meta_buffers, cpy_dst_int4_ptr, kNumMetaBytes);
                 }
 
-                TMA_STORE_TAG(kEager_combine, intra_node, cpy_dst_int4_ptr, hidden_bf16_int4, long_msg_ext_len_int4, __tail_tags, combine_round_n, num_send_bytes);
+                TMA_SAVE_TAG(kEager_combine, intra_node, cpy_dst_int4_ptr, hidden_bf16_int4, long_msg_ext_len_int4, __tail_tags, combine_round_n, num_send_bytes);
                 // if constexpr (kEager_combine != EAGER_OFF) {
                 //     if (!intra_node) {
                 //         __syncwarp();
@@ -1088,7 +1088,7 @@ combine(void* combined_x,
                     mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
                     auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
                     if (check_tag) {
-                        WAIT_BIT(buffer, long_msg_ext_len, lane_id, 32, combine_round_n, "COMBINE");
+                        WAIT_BIT(buffer, long_msg_ext_len, lane_id, 32, combine_round_n, token_idx, i, topk_idx_reg, src_rank, "COMBINE");
                         // constexpr int pages = PAGE_N(long_msg_len);
                         // if (lane_id < pages) {
                         //     int *__check_ptr = reinterpret_cast<int*>(buffer + ((lane_id == pages - 1) ? (long_msg_ext_len - sizeof(int4)) : ((lane_id << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
