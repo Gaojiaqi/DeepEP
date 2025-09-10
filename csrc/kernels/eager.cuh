@@ -118,6 +118,9 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 #define TAG_CNT_MASK 0x3fffffff
 #define TAG_TYPE(tag) ((tag >> 31) & 1)
 #define SHORT_TAG(tag) (((TAG_TYPE(tag) << 15) | ((((tag) & TAG_CNT_MASK) % 0x7fff) + 1)) << 16)
+#define CHECK_TIME_MASK 0xffffff
+#define FINAL_TIME_MASK 0x10000000
+
 
 #define PARALLEL_SET_TAG(send_buf, ext_len, tagv, exec_id, exec_total, st_func) {\
     const int __pages = EXT_PAGE_N(ext_len);\
@@ -127,26 +130,29 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define WAIT_BIT(recv_buf, ext_len, exec_id, exec_total, tagv, intra_node) {\
-    int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
+#define WAIT_BIT(recv_buf, ext_len, exec_id, exec_total, tagv, kernel_name) {\
+    int __page_n = EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
-        int ld_value;\
-        int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n));\
+        int ld_value, w_cnt;\
+        int* _check_ptr = reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n));\
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\
             if (ld_value == ZTAG(tagv)) break;\
+            w_cnt += 1;\
+            if (w_cnt == FINAL_TIME_MASK) {\
+                printf("[rank %d]: [EAGER " kernel_name " HANG] combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, tagv, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, recv_buf), w_cnt, _value, ZTAG(tagv));
+                break;\
+            }\
         }\
     }\
+    __syncwarp();\
 }
 
-#define CHECK_TIME_MASK 0xffffff
-#define FINAL_TIME_MASK 0x10000000
-
-#define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, intra_node, warp_id, count_cache_ptr) {\
-    int __page_n = intra_node ? 1 : EXT_PAGE_N(ext_len);\
+#define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, warp_id, count_cache_ptr, kernel_name) {\
+    int __page_n = EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
         int ld_value, w_cnt;\
-        int* _check_ptr = intra_node ? reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(recv_buf) + ext_len - sizeof(int4)) : reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n)) ;\
+        int* _check_ptr = reinterpret_cast<int*>(CHK_POSITION(recv_buf, ext_len, target, __page_n)) ;\
         while (true) {\
             ld_value = ld_acquire_sys_global(_check_ptr);\
             if (ld_value == ZTAG(tagv)) {\
@@ -166,11 +172,12 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             }\
             w_cnt += 1;\
             if (w_cnt == FINAL_TIME_MASK) {\
-                printf("[rank %d]: [EAGER DISPATCH HANG] dispatch round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu for %d times, 0x%08x != 0x%08x, cnt = %d(%d)\n", rank, dispatch_round_n, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv), count_value, -count_value-1);\
+                printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu for %d times, 0x%08x != 0x%08x, cnt = %d(%d)\n", rank, tagv, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv), count_value, -count_value-1);\
                 break;\
             }\
         };\
     }\
+    __syncwarp();\
 }
 
 #define NORMAL_ST(PTR, VALUE) *(PTR) = VALUE
@@ -224,7 +231,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, gmem_base, tag_save, tagv, kparam, intra_node) {\
+#define TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, gmem_base, tag_save, tagv, intra_node) {\
     if (!intra_node) {\
         const auto diff = PTR_DIFF(gmem_ptr, gmem_base);\
         int __BASE_PN__ = diff >> PCIE_SEG_LEN_LOG;\
@@ -236,6 +243,42 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
         }\
     }\
     if (lane_id == 0) tma_func(smem_ptr, gmem_ptr, bytes);\
+}
+
+#define TMA_SAVE_TAG(kparam, intra_node, cpy_dst_int4_ptr, hidden_int4, long_msg_ext_len_int4, tail_tags, combine_round_n, num_send_bytes) {\
+    if constexpr (kparam != EAGER_OFF) {\
+        if (!intra_node) {\
+            __syncwarp();\
+            _Pragma("unroll") \
+            for (int __pn = 0; __pn < MAX_PAGES; ++__pn) {\
+                reinterpret_cast<int*>(tail_tags)[__pn] = __shfl_sync(0xffffffff, reinterpret_cast<int*>(tail_tags)[__pn], 0);\
+            }\
+            if (lane_id < MAX_PAGES_DIV4) {\
+                auto target_ptr = cpy_dst_int4_ptr + hidden_bf16_int4 + lane_id;\
+                *target_ptr = reinterpret_cast<int4*>(tail_tags)[lane_id];\
+            }\
+            if (lane_id == 0) {\
+                *reinterpret_cast<int*>(cpy_dst_int4_ptr + long_msg_ext_len_int4 - 1) = ZTAG(combine_round_n);\
+            }\
+            __syncwarp();\
+            num_send_bytes = long_msg_ext_len_int4 * sizeof(int4);\
+        }\
+    }\
+}
+
+#define TMA_RESTORE_TAG(kparam, intra_node, smem_token_ptr, ext_len, decode_warp_idx, group_idx, num_decode_warps) {\
+    if constexpr (kparam != EAGER_OFF) {\
+        constexpr int pages = EXT_PAGE_N(ext_len);\
+        if (!intra_node) {\
+            if (decode_warp_idx == 0 && lane_id < pages - 1) {\
+                const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;\
+                const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));\
+                int save_value = *(reinterpret_cast<int*>(smem_token_ptr + ld_offset));\
+                st_release_cta(reinterpret_cast<int*>(smem_token_ptr + st_offset), save_value);\
+            }\
+            asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));\
+        }\
+    }\
 }
 
 #endif // __CUDACC__

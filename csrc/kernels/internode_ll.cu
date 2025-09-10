@@ -125,10 +125,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
             constexpr size_t page_int2 = page_int4 << 1;
-            const size_t data_st_int4_offset = 
-            kEager != EAGER_OFF ? 
-                ((thread_id + 1) < page_int4 ? 0 : (thread_id + 1) < 2 * page_int4 ? 1 : (thread_id + 1) < 3 * page_int4 ? 2 : (thread_id + 1) < 4 * page_int4 ? 3 : 4)
-                : 0;
+            const size_t data_st_int4_offset = kEager != EAGER_OFF ? DIV255(thread_id + 1) : 0; // page_int4 == 255
             const size_t data_st_int2_offset = kEager != EAGER_OFF ? ((thread_id + 2) < page_int2 ? 0 : (thread_id + 2) < 2 * page_int2 ? 2 : 4) : 0;
 
             if (thread_id == 0) {
@@ -181,6 +178,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 }
             }
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
+
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
@@ -195,7 +193,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      (reinterpret_cast<uint64_t>(rdma_recv_x) +
                                      rank * num_local_experts * num_max_dispatch_tokens_per_rank * msg_distance +
                                      dst_expert_local_idx * num_max_dispatch_tokens_per_rank * msg_distance +
-                                     slot_idx * msg_distance);
+                                     slot_idx * msg_distance); // rearange layout to make dispatch and combine use same region for intra-node
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (dst_p2p_ptr == 0) {
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
@@ -315,7 +313,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 src_rank * num_max_dispatch_tokens_per_rank * msg_distance) :
                 (static_cast<uint8_t*>(rdma_recv_x) +
                 src_rank * num_local_experts * num_max_dispatch_tokens_per_rank * msg_distance +
-                local_expert_idx * num_max_dispatch_tokens_per_rank * msg_distance);
+                local_expert_idx * num_max_dispatch_tokens_per_rank * msg_distance); // rearange layout to make dispatch and combine use same region for intra-node
         const auto recv_x_int4 = static_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
@@ -326,6 +324,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto num_aligned_scales = align<int>(num_scales, sizeof(float) / sizeof(scale_t));
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
 
+        // WARN: directly used without param!!!
         auto recv_cnt_barrier = atomic_finish_counter_per_expert + num_experts + local_expert_idx;
 
         // Shared between sub-warps in warp groups
@@ -338,6 +337,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto normal_recv = kEager != EAGER_FULL || ld_intra_node;
         
         if constexpr (kEager == EAGER_FULL) {
+            // initialize packed_recv_count and per_rank_recv_count
             if (sub_warp_id == 1 && lane_id == 0) {
                 int cur_v = atomic_add_release_global(recv_cnt_barrier, 1);
                 if (!normal_recv) {
@@ -394,8 +394,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             
             if constexpr (kEager == EAGER_FULL) {
                 if (!ld_intra_node) {
-                    WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, ld_intra_node, sub_warp_id, shared_num_recv_tokens + warp_group_id);
-                    __syncwarp();
+                    WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, sub_warp_id, shared_num_recv_tokens + warp_group_id, "DISPATCH");
                     num_recv_tokens = warp_reduce_min(num_recv_tokens);
                     
                     if (num_recv_tokens != 0 && i >= (-num_recv_tokens-1)) {
@@ -418,8 +417,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     }
                 }
             } else if constexpr (kEager != EAGER_OFF) {
-                WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, ld_intra_node);
-                __syncwarp();
+                WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, "DISPATCH");
             }
             
             if constexpr (kEager != EAGER_FULL) {
@@ -740,9 +738,9 @@ combine(void* combined_x,
     constexpr size_t num_bytes_per_slot_v = kHidden * sizeof(nv_bfloat16) + kNumMetaBytes;
     constexpr size_t num_bytes_per_slot = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_slot_v, AR_MSG_ALIGNMENT) : num_bytes_per_slot_v;
     
-    // WARNING!!! Two lines below must be consistent with msg def in config.hpp
     constexpr int kNumPerChannels = 128;
     constexpr int num_scales = kHidden / kNumPerChannels;
+    // WARNING!!! Two lines below must be consistent with msg def in config.hpp
     constexpr size_t dispatch_msg_max = sizeof(int4) + std::max(kHidden * sizeof(nv_bfloat16), kHidden + num_scales * sizeof(float));
     constexpr size_t combine_msg_max = num_scales * sizeof(nv_bfloat162) + kHidden * sizeof(nv_bfloat16);
     constexpr size_t msg_distance = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(std::max(dispatch_msg_max, combine_msg_max) + sizeof(int4), AR_MSG_LONG_ALIGNMENT) : num_bytes_per_slot_v;
@@ -904,7 +902,7 @@ combine(void* combined_x,
                         tma_offset_bytes += num_tma_bytes;
                     } else {
                         // BF16 original values
-#define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, combine_round_n, kEager_combine, intra_node)
+#define COMBINE_SEND_TMA(tma_func, smem_ptr, gmem_ptr, bytes) TMA_AUTO_TAG(tma_func, smem_ptr, gmem_ptr, bytes, cpy_dst_int4_ptr, __tail_tags, combine_round_n, intra_node)
                         auto w_offset_int4 = iter_idx * kNumSendUnrolls * 32;
                         if constexpr (kEager_combine == EAGER_OFF) {
                             if (elect_one_sync(lane_id)) {
@@ -924,24 +922,25 @@ combine(void* combined_x,
                         tma_store_1d(meta_buffers, cpy_dst_int4_ptr, kNumMetaBytes);
                 }
 
-                if constexpr (kEager_combine != EAGER_OFF) {
-                    if (!intra_node) {
-                        __syncwarp();
-                        #pragma unroll
-                        for (int __pn = 0; __pn < MAX_PAGES; ++__pn) {
-                            __tail_tags[__pn] = __shfl_sync(0xffffffff, __tail_tags[__pn], 0);
-                        }
-                        if (lane_id < MAX_PAGES_DIV4) {
-                            auto target_ptr = cpy_dst_int4_ptr + (hidden_bf16_int4 + lane_id);
-                            *target_ptr = __tail_tags_int4[lane_id];
-                        }
-                        if (lane_id == 0) {
-                            *reinterpret_cast<int*>(cpy_dst_int4_ptr + long_msg_ext_len_int4 - 1) = ZTAG(combine_round_n);
-                        }
-                        __syncwarp();
-                        num_send_bytes = long_msg_ext_len;
-                    }
-                }
+                TMA_STORE_TAG(kEager_combine, intra_node, cpy_dst_int4_ptr, hidden_bf16_int4, long_msg_ext_len_int4, __tail_tags, combine_round_n, num_send_bytes);
+                // if constexpr (kEager_combine != EAGER_OFF) {
+                //     if (!intra_node) {
+                //         __syncwarp();
+                //         #pragma unroll
+                //         for (int __pn = 0; __pn < MAX_PAGES; ++__pn) {
+                //             __tail_tags[__pn] = __shfl_sync(0xffffffff, __tail_tags[__pn], 0);
+                //         }
+                //         if (lane_id < MAX_PAGES_DIV4) {
+                //             auto target_ptr = cpy_dst_int4_ptr + (hidden_bf16_int4 + lane_id);
+                //             *target_ptr = __tail_tags_int4[lane_id];
+                //         }
+                //         if (lane_id == 0) {
+                //             *reinterpret_cast<int*>(cpy_dst_int4_ptr + long_msg_ext_len_int4 - 1) = ZTAG(combine_round_n);
+                //         }
+                //         __syncwarp();
+                //         num_send_bytes = long_msg_ext_len;
+                //     }
+                // }
 
                 // Flush all stores
                 tma_store_wait();
@@ -1089,20 +1088,21 @@ combine(void* combined_x,
                     mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
                     auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
                     if (check_tag) {
-                        constexpr int pages = PAGE_N(long_msg_len);
-                        if (lane_id < pages) {
-                            int *__check_ptr = reinterpret_cast<int*>(buffer + ((lane_id == pages - 1) ? (long_msg_ext_len - sizeof(int4)) : ((lane_id << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
-                            int w_cnt = 0;
-                            int _value;
-                            while ((_value = ld_acquire_sys_global(__check_ptr)) != ZTAG(combine_round_n)) {
-                                w_cnt += 1;
-                                if (w_cnt == FINAL_TIME_MASK) {
-                                    printf("[rank %d]: [EAGER COMBINE HANG] combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
-                                    break;
-                                }
-                            }
-                        }
-                        __syncwarp();
+                        WAIT_BIT(buffer, long_msg_ext_len, lane_id, 32, combine_round_n, "COMBINE");
+                        // constexpr int pages = PAGE_N(long_msg_len);
+                        // if (lane_id < pages) {
+                        //     int *__check_ptr = reinterpret_cast<int*>(buffer + ((lane_id == pages - 1) ? (long_msg_ext_len - sizeof(int4)) : ((lane_id << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
+                        //     int w_cnt = 0;
+                        //     int _value;
+                        //     while ((_value = ld_acquire_sys_global(__check_ptr)) != ZTAG(combine_round_n)) {
+                        //         w_cnt += 1;
+                        //         if (w_cnt == FINAL_TIME_MASK) {
+                        //             printf("[rank %d]: [EAGER COMBINE HANG] combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
+                        //             break;
+                        //         }
+                        //     }
+                        // }
+                        // __syncwarp();
                     }
                     if constexpr (kUseLogFMT) {
                         logfmt_check_amaxmin<kNumDivisions / 2, kNumSendUnrolls, kNumRecvUnrolls>(
@@ -1146,18 +1146,19 @@ combine(void* combined_x,
                     const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
                     const auto intra_node = ((topk_idx / num_local_experts) >> 3) == (rank >> 3); // TODO: identify intra node more elegantly
                     mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
-                    if constexpr (kEager_combine != EAGER_OFF) {
-                        constexpr int pages = PAGE_N(long_msg_len);
-                        if (!intra_node) {
-                            if (decode_warp_idx == 0 && lane_id < pages - 1) {
-                                const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;
-                                const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));
-                                int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + ld_offset));
-                                st_release_cta(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + st_offset), save_value);
-                            }
-                            asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));
-                        }
-                    }
+                    TMA_RESTORE_TAG(kEager_combine, intra_node, tma_ld_buffers[stage_idx], long_msg_ext_len, decode_warp_idx, group_idx, num_decode_warps);
+                    // if constexpr (kEager_combine != EAGER_OFF) {
+                    //     constexpr int pages = PAGE_N(long_msg_len);
+                    //     if (!intra_node) {
+                    //         if (decode_warp_idx == 0 && lane_id < pages - 1) {
+                    //             const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;
+                    //             const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));
+                    //             int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + ld_offset));
+                    //             st_release_cta(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + st_offset), save_value);
+                    //         }
+                    //         asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));
+                    //     }
+                    // }
                     if constexpr (kUseLogFMT) {
                         const auto& info = cast_info_buffers[stage_idx][decode_warp_idx];
                         bool enable_cast = info & 1;
