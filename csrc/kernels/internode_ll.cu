@@ -1002,7 +1002,14 @@ combine(void* combined_x,
                 if (sub_warp_id == 0 and lane_id == 0) {
                     const auto target_value = (SHORT_TAG(combine_round_n) | 1);
                     int _value;
-                    while ((_value = ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx)) != target_value);
+                    int w_cnt = 0;
+                    while ((_value = ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx)) != target_value) {
+                        w_cnt += 1;
+                        if (w_cnt == FINAL_TIME_MASK) {
+                            printf("[rank %d]: [EAGER COMBINE HANG] round 0x%08x waiting intranode signal from expert %d at rank %d for %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, responsible_expert_idx, src_rank, w_cnt, _value, target_value);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1178,7 +1185,14 @@ combine(void* combined_x,
             if (!intra_node && sub_warp_id == 0 and lane_id == 0) {
                 const auto target_value = (SHORT_TAG(combine_round_n) | 1);
                 int _value;
-                while ((_value = ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx)) != target_value);
+                int w_cnt = 0;
+                while ((_value = ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx)) != target_value) {
+                    w_cnt += 1;
+                    if (w_cnt == FINAL_TIME_MASK) {
+                        printf("[rank %d]: [EAGER COMBINE HANG] round 0x%08x waiting internode signal from expert %d at rank %d for %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, responsible_expert_idx, src_rank, w_cnt, _value, target_value);
+                        break;
+                    }
+                }
             }
         }
     }

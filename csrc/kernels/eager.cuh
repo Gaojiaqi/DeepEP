@@ -53,6 +53,12 @@ __device__ __forceinline__ int ld_acquire_sys_global(int *ptr) {
     return ret;
 }
 
+__device__ __forceinline__ int ld_relaxed_sys_global(int *ptr) {
+    int ret;
+    asm volatile("ld.relaxed.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
 __device__ __forceinline__ int ld_acquire_shared(const int* ptr) {
     int ret;
     asm volatile("ld.acquire.shared.cta.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
@@ -160,7 +166,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             }\
             if (count_value == 0) {\
                 if (warp_id == 0) {\
-                    count_value = ld_acquire_sys_global(count_ptr);\
+                    count_value = ld_relaxed_sys_global(count_ptr);\
                     count_value = ((count_value & 0xffff0000) == SHORT_TAG(tagv)) ? (count_value | 0xffff0000) : 0;\
                     if (count_value != 0) st_release_cta(count_cache_ptr, count_value);\
                 } else {\
