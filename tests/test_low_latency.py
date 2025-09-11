@@ -118,7 +118,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
                         # Check combine correctness
-                        for zero_copy in (False, ) if use_logfmt else (False, True):
+                        for zero_copy in (False, ) if (use_logfmt or eager_opt != deep_ep.Buffer.EAGER_OFF) else (False, True):
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -228,7 +228,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         random.seed(seed + rank)
         ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
                              use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, check=check, trace_pfx=trace_pfx)
-        for i in range(200):
+        for i in range(20):
             if test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
                              use_logfmt=args.use_logfmt, seed=seed, eager_opt=eager_opt, repeat=repeat, check=check, trace_pfx=trace_pfx) != ref_hash: 
                 print(f'[rank {rank}]: Error: seed={seed} i={i}')

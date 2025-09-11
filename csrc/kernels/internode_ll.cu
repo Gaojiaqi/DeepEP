@@ -498,7 +498,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     // auto recv_cnt_barrier = atomic_finish_counter_per_expert + num_experts; // num_local_experts int
     // WARNING: recv_cnt_barrier is used without param in dispatch, do not overwrite it when eager on.
-    EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+    EP_HOST_ASSERT((num_experts * 2 + num_experts / num_ranks) * sizeof(int) <= NUM_WORKSPACE_BYTES);
     // FP8 checks
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
@@ -923,24 +923,6 @@ combine(void* combined_x,
                 }
 
                 TMA_SAVE_TAG(kEager_combine, intra_node, cpy_dst_int4_ptr, hidden_bf16_int4, long_msg_ext_len_int4, __tail_tags, combine_round_n, num_send_bytes);
-                // if constexpr (kEager_combine != EAGER_OFF) {
-                //     if (!intra_node) {
-                //         __syncwarp();
-                //         #pragma unroll
-                //         for (int __pn = 0; __pn < MAX_PAGES; ++__pn) {
-                //             __tail_tags[__pn] = __shfl_sync(0xffffffff, __tail_tags[__pn], 0);
-                //         }
-                //         if (lane_id < MAX_PAGES_DIV4) {
-                //             auto target_ptr = cpy_dst_int4_ptr + (hidden_bf16_int4 + lane_id);
-                //             *target_ptr = __tail_tags_int4[lane_id];
-                //         }
-                //         if (lane_id == 0) {
-                //             *reinterpret_cast<int*>(cpy_dst_int4_ptr + long_msg_ext_len_int4 - 1) = ZTAG(combine_round_n);
-                //         }
-                //         __syncwarp();
-                //         num_send_bytes = long_msg_ext_len;
-                //     }
-                // }
 
                 // Flush all stores
                 tma_store_wait();
@@ -1089,20 +1071,6 @@ combine(void* combined_x,
                     auto buffer = static_cast<uint8_t*>(rdma_recv_x) + (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * msg_distance;
                     if (check_tag) {
                         WAIT_BIT(buffer, long_msg_ext_len, lane_id, 32, combine_round_n, token_idx, i, topk_idx_reg, src_rank, "COMBINE");
-                        // constexpr int pages = PAGE_N(long_msg_len);
-                        // if (lane_id < pages) {
-                        //     int *__check_ptr = reinterpret_cast<int*>(buffer + ((lane_id == pages - 1) ? (long_msg_ext_len - sizeof(int4)) : ((lane_id << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
-                        //     int w_cnt = 0;
-                        //     int _value;
-                        //     while ((_value = ld_acquire_sys_global(__check_ptr)) != ZTAG(combine_round_n)) {
-                        //         w_cnt += 1;
-                        //         if (w_cnt == FINAL_TIME_MASK) {
-                        //             printf("[rank %d]: [EAGER COMBINE HANG] combine round 0x%08x token %d topk %d from exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx_reg, src_rank, PTR_DIFF(__check_ptr, buffer), w_cnt, _value, ZTAG(combine_round_n));
-                        //             break;
-                        //         }
-                        //     }
-                        // }
-                        // __syncwarp();
                     }
                     if constexpr (kUseLogFMT) {
                         logfmt_check_amaxmin<kNumDivisions / 2, kNumSendUnrolls, kNumRecvUnrolls>(
@@ -1147,18 +1115,6 @@ combine(void* combined_x,
                     const auto intra_node = ((topk_idx / num_local_experts) >> 3) == (rank >> 3); // TODO: identify intra node more elegantly
                     mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
                     TMA_RESTORE_TAG(kEager_combine, intra_node, tma_ld_buffers[stage_idx], long_msg_ext_len, decode_warp_idx, group_idx, num_decode_warps);
-                    // if constexpr (kEager_combine != EAGER_OFF) {
-                    //     constexpr int pages = PAGE_N(long_msg_len);
-                    //     if (!intra_node) {
-                    //         if (decode_warp_idx == 0 && lane_id < pages - 1) {
-                    //             const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;
-                    //             const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));
-                    //             int save_value = *(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + ld_offset));
-                    //             st_release_cta(reinterpret_cast<int*>(tma_ld_buffers[stage_idx] + st_offset), save_value);
-                    //         }
-                    //         asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));
-                    //     }
-                    // }
                     if constexpr (kUseLogFMT) {
                         const auto& info = cast_info_buffers[stage_idx][decode_warp_idx];
                         bool enable_cast = info & 1;
