@@ -1299,7 +1299,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               num_topk, num_experts, rank, num_ranks,
                               use_logfmt,
                               workspace, num_device_sms,
-                              launch_stream, phases, zero_copy, ll_combine_round_n, use_logfmt ? EAGER_OFF : eager_opt);
+                              launch_stream, phases, zero_copy, ll_combine_round_n, eager_opt);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     if (!return_recv_hook) {

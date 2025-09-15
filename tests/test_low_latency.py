@@ -118,7 +118,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
                         # Check combine correctness
-                        for zero_copy in (False, ) if (use_logfmt or eager_opt != deep_ep.Buffer.EAGER_OFF) else (False, True):
+                        for zero_copy in (False, ) if use_logfmt else (False, True):
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -131,7 +131,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             if do_check:
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
                                 assert torch.isnan(combined_x).sum().item() == 0, f'[rank {rank}]: Error: nan in combine_x {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}'
-                                assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {round_scale=} {use_ue8m0=} {seed=}'
+                                assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {use_logfmt=} {round_scale=} {use_ue8m0=} {seed=}'
                                 hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames

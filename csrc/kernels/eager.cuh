@@ -154,6 +154,17 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     __syncwarp();\
 }
 
+#define WARP_WAIT_LEN_AND_BIT(recv_buf, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name) {\
+    int head_value, data_len;\
+    if (lane_id == 0) {\
+        while (((head_value = ld_acquire_sys_global(reinterpret_cast<int*>(recv_buf))) & 0xffff0000u) != SHORT_TAG(tagv));\
+        data_len = head_value & 0xffff;\
+    }\
+    data_len = __shfl_sync(0xffffffff, data_len, 0);\
+    int ext_len = data_len + 2 * sizeof(int);\
+    WAIT_BIT(recv_buf, ext_len, lane_id, 32, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name);\
+}
+
 #define WAIT_2BIT(recv_buf, ext_len, exec_id, exec_total, tagv, count_ptr, count_value, token_idx, warp_id, count_cache_ptr, kernel_name) {\
     int __page_n = EXT_PAGE_N(ext_len);\
     for (int target = exec_id; target < __page_n; target += exec_total) {\
@@ -260,7 +271,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
                 reinterpret_cast<int*>(tail_tags)[__pn] = __shfl_sync(0xffffffff, reinterpret_cast<int*>(tail_tags)[__pn], 0);\
             }\
             if (lane_id < MAX_PAGES_DIV4) {\
-                auto target_ptr = cpy_dst_int4_ptr + hidden_bf16_int4 + lane_id;\
+                auto target_ptr = cpy_dst_int4_ptr + hidden_int4 + lane_id;\
                 *target_ptr = reinterpret_cast<int4*>(tail_tags)[lane_id];\
             }\
             if (lane_id == 0) {\
@@ -272,15 +283,29 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define TMA_RESTORE_TAG(kparam, intra_node, smem_token_ptr, ext_len, decode_warp_idx, group_idx, num_decode_warps) {\
+#define TMA_RESTORE_TAG(kparam, logfmt_param, intra_node, smem_token_ptr, ext_len, decode_warp_idx, group_idx, num_decode_warps) {\
     if constexpr (kparam != EAGER_OFF) {\
         constexpr int pages = EXT_PAGE_N(ext_len);\
         if (!intra_node) {\
-            if (decode_warp_idx == 0 && lane_id < pages - 1) {\
-                const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;\
-                const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));\
-                int save_value = *(reinterpret_cast<int*>(smem_token_ptr + ld_offset));\
-                st_release_cta(reinterpret_cast<int*>(smem_token_ptr + st_offset), save_value);\
+            if constexpr (logfmt_param) {\
+                if (decode_warp_idx == 0) {\
+                    int data_len = lane_id == 0 ? (*reinterpret_cast<int*>(smem_token_ptr) & 0xffff) : 0;\
+                    data_len = __shfl_sync(0xffffffff, data_len, 0);\
+                    const int pages = EXT_PAGE_N(data_len + (MAX_PAGES_DIV4 + 1) * sizeof(int4));\
+                    if (lane_id < pages - 1) {\
+                        const auto ld_offset = lane_id < 2 ? (sizeof(int) * (lane_id + 2)) : (data_len + (MAX_PAGES + lane_id - 1) * sizeof(int));\
+                        const auto st_offset = (lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ);\
+                        int save_value = *(reinterpret_cast<int*>(smem_token_ptr + ld_offset));\
+                        st_release_cta(reinterpret_cast<int*>(smem_token_ptr + st_offset), save_value);\
+                    }\
+                }\
+            } else {\
+                if (decode_warp_idx == 0 && lane_id < pages - 1) {\
+                    const auto ld_offset = kHidden * sizeof(nv_bfloat16) + sizeof(int) * lane_id;\
+                    const auto st_offset = ((lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ));\
+                    int save_value = *(reinterpret_cast<int*>(smem_token_ptr + ld_offset));\
+                    st_release_cta(reinterpret_cast<int*>(smem_token_ptr + st_offset), save_value);\
+                }\
             }\
             asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 2), "r"(num_decode_warps * 32));\
         }\
