@@ -155,13 +155,21 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 }
 
 #define WARP_WAIT_LEN_AND_BIT(recv_buf, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name) {\
-    int head_value, data_len;\
+    uint64_t head_value, data_len;\
     if (lane_id == 0) {\
-        while (((head_value = ld_acquire_sys_global(reinterpret_cast<int*>(recv_buf))) & 0xffff0000u) != SHORT_TAG(tagv));\
-        data_len = head_value & 0xffff;\
+        int w_cnt = 0;\
+        while ((int)(head_value = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(recv_buf)))!= ZTAG(tagv)) {\
+            w_cnt += 1;\
+            if (w_cnt == FINAL_TIME_MASK) {\
+                printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x token %d topk %d recv from expert %d at rank %d, can not get header for logfmt message, 0x%08x != 0x%08x\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, (int)(head_value & 0xffffffff), ZTAG(tagv));\
+                trap();\
+            }\
+        }\
+        data_len = head_value >> 32;\
+        /*printf("[rank %d]: combine round 0x%08x token %d topk %d recv from expert %d at rank %d, len: %lu\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, data_len)*/;\
     }\
     data_len = __shfl_sync(0xffffffff, data_len, 0);\
-    int ext_len = data_len + 2 * sizeof(int);\
+    int ext_len = data_len + 2 * sizeof(int4);\
     WAIT_BIT(recv_buf, ext_len, lane_id, 32, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name);\
 }
 

@@ -938,13 +938,27 @@ combine(void* combined_x,
                                 cpy_dst_int4_ptr[0] = head_pack;
                                 head_pack.y = __tail_tags[2];
                                 head_pack.z = __tail_tags[3];
-                                cpy_dst_int4_ptr[1 + hidden_bf16_int4] = head_pack;
+                                cpy_dst_int4_ptr[1 + num_send_bytes / sizeof(int4)] = head_pack;
                             }
+                            //printf("[rank %d]: combine round 0x%08x expert %d send back rank %d token %d, len %d\n", rank, combine_round_n, local_expert_idx + rank * num_local_experts, dst_rank, src_idx, num_send_bytes);
                         }
                     }
                 } else {
                     TMA_SAVE_TAG(kEager_combine, intra_node, cpy_dst_int4_ptr, hidden_bf16_int4, long_msg_ext_len_int4, __tail_tags, combine_round_n, num_send_bytes);
                 }
+
+                // if constexpr (kUseLogFMT && kEager_combine != EAGER_OFF) {
+                //     if (lane_id < MAX_PAGES) {
+                //         const size_t ld_offset = (lane_id << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ;
+                //         const size_t st_offset = lane_id < 2 ? ((lane_id + 2) * sizeof(int)) : (num_send_bytes + sizeof(int4) + (lane_id - 1) * sizeof(int));
+                //         uint8_t *inplace_buf = reinterpret_cast<uint8_t*>(cpy_dst_int4_ptr);
+                //         inplace_buf[st_offset] = inplace_buf[ld_offset];
+                //         inplace_buf[ld_offset] = ZTAG(combine_round_n);
+                //     }
+                //     if (lane_id == 0) {
+                //         *reinterpret_cast<uint64_t*>(cpy_dst_int4_ptr) = (uint64_t)ZTAG(combine_round_n) | ((uint64_t)num_send_bytes << 32);
+                //     }
+                // }
 
                 // Flush all stores
                 tma_store_wait();
@@ -1013,7 +1027,7 @@ combine(void* combined_x,
     LOW_LATENCY_COMBINE_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
         return;
-    
+
     if constexpr (kEager_combine != EAGER_FULL) {
         // Wait all ranks to arrive
         if (responsible_expert_idx < num_experts) {
@@ -1283,7 +1297,7 @@ void combine(void* combined_x,
     const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes);
 
     // Receive buffer size
-    const int num_recv_tma_bytes = 16 + hidden * 2 + (eager_opt != EAGER_OFF ? 6 * sizeof(int4) : 0);
+    const int num_recv_tma_bytes = 16 + hidden * 2 + (eager_opt != EAGER_OFF ? (6 * sizeof(int4)) : 0);
     const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3);
 
     // Total requirement
@@ -1291,7 +1305,7 @@ void combine(void* combined_x,
 
 #define COMBINE_LAUNCH_CASE(eager_opt, hidden) { \
 auto combine_func = use_logfmt ? \
-    combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls, EAGER_OFF> : \
+    combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls, eager_opt> : \
     combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls, eager_opt>; \
 SET_SHARED_MEMORY_FOR_TMA(combine_func); \
 LAUNCH_KERNEL(&cfg, combine_func, \
