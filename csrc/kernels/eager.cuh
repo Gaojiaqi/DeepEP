@@ -73,6 +73,10 @@ __device__  __forceinline__ void st_release_cta(const uint8_t *ptr, uint8_t val)
     asm volatile("st.release.cta.u8 [%0], %1;"::"l"(ptr), "h"(static_cast<uint16_t>(val)) : "memory");
 }
 
+__device__  __forceinline__ void st_release_cta(const uint64_t *ptr, uint64_t val) {
+    asm volatile("st.release.cta.u64 [%0], %1;"::"l"(ptr), "l"(val) : "memory");
+}
+
 __device__  __forceinline__ void st_release_cta(const int4 *ptr, int4 val) {
     asm volatile("st.release.cta.v4.s32 [%0], {%1, %2, %3, %4};" 
             : : "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
@@ -146,7 +150,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             if (ld_value == ZTAG(tagv)) break;\
             w_cnt += 1;\
             if (w_cnt == FINAL_TIME_MASK) {\
-                printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x token %d topk %d from/to exp %d at rank %d, check offset %lu, %d times, 0x%08x != 0x%08x\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, PTR_DIFF(__check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv));\
+                printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x token %d topk %d from/to exp %d at rank %d, check offset %lu/%lu, %d times, 0x%08x != 0x%08x\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, PTR_DIFF(__check_ptr, recv_buf), (uint64_t)ext_len, w_cnt, ld_value, ZTAG(tagv));\
                 break;\
             }\
         }\
@@ -154,7 +158,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     __syncwarp();\
 }
 
-#define WARP_WAIT_LEN_AND_BIT(recv_buf, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name) {\
+#define WARP_WAIT_LEN_AND_BIT(recv_buf, head_pack, tagv, token_idx, topk_i, topk_idx, exp_rank, kernel_name) {\
     uint64_t head_value, data_len;\
     if (lane_id == 0) {\
         int w_cnt = 0;\
@@ -166,7 +170,9 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             }\
         }\
         data_len = head_value >> 32;\
-        /*printf("[rank %d]: combine round 0x%08x token %d topk %d recv from expert %d at rank %d, len: %lu\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, data_len)*/;\
+        printf("[rank %d]: combine round 0x%08x token %d topk %d recv from expert %d at rank %d, len: %lu\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, data_len);\
+        st_release_cta(reinterpret_cast<uint64_t*>(head_pack), ld_nc_global(reinterpret_cast<uint64_t*>(recv_buf) + 1));\
+        st_release_cta(head_pack + 2, (int)data_len);\
     }\
     data_len = __shfl_sync(0xffffffff, data_len, 0);\
     int ext_len = data_len + 2 * sizeof(int4);\
@@ -263,8 +269,11 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
         int __TAIL_PN__ = (diff + bytes) >> PCIE_SEG_LEN_LOG;\
         if (lane_id == 0 && __BASE_PN__ != __TAIL_PN__) {\
             int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
-            tag_save[__BASE_PN__] = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
-            st_release_cta(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset), ZTAG(tagv));\
+            int* tag_tma_ptr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
+            tag_save[__BASE_PN__] = *tag_tma_ptr;\
+            printf("[rank %d]: combine round 0x%08x put %d tag (smem offset %d) on rank %d token %d, backup 0x%08x\n", rank, combine_round_n, __BASE_PN__, tag_tma_offset, dst_rank, src_idx, tag_save[__BASE_PN__]);\
+            st_release_shared(tag_tma_ptr, ZTAG(tagv));\
+            __threadfence_block();\
         }\
     }\
     if (lane_id == 0) tma_func(smem_ptr, gmem_ptr, bytes);\
@@ -291,20 +300,21 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#define TMA_RESTORE_TAG(kparam, logfmt_param, intra_node, smem_token_ptr, ext_len, decode_warp_idx, group_idx, num_decode_warps) {\
+#define TMA_RESTORE_TAG(kparam, logfmt_param, intra_node, head_pack, data_offset, smem_token_ptr, ext_len, decode_warp_idx, group_idx, num_decode_warps) {\
     if constexpr (kparam != EAGER_OFF) {\
         constexpr int pages = EXT_PAGE_N(ext_len);\
         if (!intra_node) {\
             if constexpr (logfmt_param) {\
                 if (decode_warp_idx == 0) {\
-                    int data_len = lane_id == 0 ? (*reinterpret_cast<int*>(smem_token_ptr) & 0xffff) : 0;\
+                    int data_len = lane_id == 0 ? head_pack[2] : 0;\
                     data_len = __shfl_sync(0xffffffff, data_len, 0);\
                     const int pages = EXT_PAGE_N(data_len + (MAX_PAGES_DIV4 + 1) * sizeof(int4));\
                     if (lane_id < pages - 1) {\
-                        const auto ld_offset = lane_id < 2 ? (sizeof(int) * (lane_id + 2)) : (data_len + (MAX_PAGES + lane_id - 1) * sizeof(int));\
-                        const auto st_offset = (lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ);\
-                        int save_value = *(reinterpret_cast<int*>(smem_token_ptr + ld_offset));\
-                        st_release_cta(reinterpret_cast<int*>(smem_token_ptr + st_offset), save_value);\
+                        uint8_t* ld_ptr = lane_id < 2 ? reinterpret_cast<uint8_t*>(head_pack + lane_id) : (smem_token_ptr + data_len - data_offset + (lane_id - 1) * sizeof(int));\
+                        uint8_t* st_ptr = smem_token_ptr + (lane_id << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ) - data_offset - sizeof(int4);\
+                        int value = *reinterpret_cast<int*>(ld_ptr);\
+                        /*printf("[rank %d]: round 0x%08x token %d topk %d from expert %d at rank %d, restore two element at %lu with 0x%08x\n", rank, combine_round_n, token_idx, i, topk_idx, topk_idx / num_local_experts, PTR_DIFF(st_ptr, smem_token_ptr) / sizeof(nv_bfloat16), value)*/;\
+                        st_release_cta(reinterpret_cast<int*>(st_ptr), value);\
                     }\
                 }\
             } else {\

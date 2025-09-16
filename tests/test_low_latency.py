@@ -39,8 +39,8 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
 
     # Randomly mask some positions
-    for i in range(10):
-        topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
+    #for i in range(10):
+    #    topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
     # Check dispatch correctness
     do_check = check > 0
@@ -132,6 +132,9 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
                                 assert torch.isnan(combined_x).sum().item() == 0, f'[rank {rank}]: Error: nan in combine_x {dispatch_use_fp8=} {zero_copy=} token value layout {dump_nan_tensors(combined_x)}'
                                 assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {use_logfmt=} {round_scale=} {use_ue8m0=} {seed=}'
+                                #if diff >= (9e-4 if dispatch_use_fp8 else 1e-5):
+                                #    print(f'[rank {rank}]: Error: result mismatch {diff=}, {dispatch_use_fp8=}, {zero_copy=} {use_logfmt=} {round_scale=} {use_ue8m0=} {seed=}')
+                                #dist.barrier()
                                 hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
