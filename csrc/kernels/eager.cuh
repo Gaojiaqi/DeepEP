@@ -151,7 +151,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             w_cnt += 1;\
             if (w_cnt == FINAL_TIME_MASK) {\
                 printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x token %d topk %d from/to exp %d at rank %d, check offset %lu/%lu, %d times, 0x%08x != 0x%08x\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, PTR_DIFF(__check_ptr, recv_buf), (uint64_t)ext_len, w_cnt, ld_value, ZTAG(tagv));\
-                break;\
+                trap();\
             }\
         }\
     }\
@@ -170,7 +170,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             }\
         }\
         data_len = head_value >> 32;\
-        printf("[rank %d]: combine round 0x%08x token %d topk %d recv from expert %d at rank %d, len: %lu\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, data_len);\
+        /*printf("[rank %d]: combine round 0x%08x token %d topk %d recv from expert %d at rank %d, len: %lu\n", rank, tagv, token_idx, topk_i, topk_idx, exp_rank, data_len)*/;\
         st_release_cta(reinterpret_cast<uint64_t*>(head_pack), ld_nc_global(reinterpret_cast<uint64_t*>(recv_buf) + 1));\
         st_release_cta(head_pack + 2, (int)data_len);\
     }\
@@ -204,7 +204,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             w_cnt += 1;\
             if (w_cnt == FINAL_TIME_MASK) {\
                 printf("[rank %d]: [EAGER " kernel_name " HANG] round 0x%08x expert %3d from rank %d slot %d wait tag at offset %lu for %d times, 0x%08x != 0x%08x, cnt = %d(%d)\n", rank, tagv, rank * num_local_experts + local_expert_idx, src_rank, i, PTR_DIFF(_check_ptr, recv_buf), w_cnt, ld_value, ZTAG(tagv), count_value, -count_value-1);\
-                break;\
+                trap();\
             }\
         };\
     }\
@@ -271,9 +271,9 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
             int tag_tma_offset = (PCIE_SEG_LEN - PCIE_TAIL_SZ) - (diff & PCIE_SEG_LEN_MASK);\
             int* tag_tma_ptr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(smem_ptr) + tag_tma_offset);\
             tag_save[__BASE_PN__] = *tag_tma_ptr;\
-            printf("[rank %d]: combine round 0x%08x put %d tag (smem offset %d) on rank %d token %d, backup 0x%08x\n", rank, combine_round_n, __BASE_PN__, tag_tma_offset, dst_rank, src_idx, tag_save[__BASE_PN__]);\
-            st_release_shared(tag_tma_ptr, ZTAG(tagv));\
-            __threadfence_block();\
+            /*printf("[rank %d]: combine round 0x%08x put %d tag (smem offset %d) on rank %d token %d, backup 0x%08x\n", rank, combine_round_n, __BASE_PN__, tag_tma_offset, dst_rank, src_idx, tag_save[__BASE_PN__])*/;\
+            *tag_tma_ptr = ZTAG(tagv);\
+            tma_store_fence();\
         }\
     }\
     if (lane_id == 0) tma_func(smem_ptr, gmem_ptr, bytes);\
