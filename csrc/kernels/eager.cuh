@@ -1,44 +1,10 @@
 
-#ifndef __EAGER_SUPPORT_H__
-#define __EAGER_SUPPORT_H__
+#ifndef __EAGER_SUPPORT_CU_H__
+#define __EAGER_SUPPORT_CU_H__
+
+#include "eager.h"
 
 namespace deep_ep {
-
-#include <stdint.h>
-
-/*
- * @brief IB MTU based Tagging Layout
- * 
- * MTU-0    [0, ..., 4079, t0, t1, t2, ..., t15], total 4096 bytes
- * ...
- * MTU-last [0, ..., last, t0, t1, t2, ..., t15], total last + 1 + 16 bytes, note (last + 1) % 16 == 0
- */
-
-
-// use IB MTU as segment size if PCIe Relaxed Ordering is Off, max IB MTU is 4096 bytes
-#define PCIE_SEG_LEN_LOG (12) 
-#define PCIE_SEG_LEN (1 << PCIE_SEG_LEN_LOG)
-#define PCIE_SEG_LEN_MASK (PCIE_SEG_LEN - 1)  
-
-#define AR_MSG_ALIGNMENT (1 << 4) 
-// make TLP dst aligned by 256 bytes, avoid TLP spliting
-#define AR_MSG_LONG_ALIGNMENT (1 << 8)
-
-// for int4 alignment
-#define PCIE_TAIL_SZ (1 << 4) 
-
-#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
-#define CEIL_ALIGN(a, b) (CEIL_DIV(a, b) * (b))
-#define NON_ZERO(x, y) ((x) < (y) ? (0) : ((x) - (y)))
-#define PAGE_N(size) CEIL_DIV(size, PCIE_SEG_LEN - PCIE_TAIL_SZ)
-#define FULL_MSG_LEN(size) ((size) + (PAGE_N(size) * PCIE_TAIL_SZ))
-#define EXTEND_FOR_TAG_AND_ALIGN(size, alignment) CEIL_ALIGN(FULL_MSG_LEN(size), alignment)
-
-#define DISPATCH_ROUND_INT 0x40000000
-#define COMBINE_ROUND_INT 0xc0000000
-#define ROUND_MASK 0x3fffffff
-
-#ifdef __CUDACC__
 
 #include "utils.cuh"
 __device__ __forceinline__ uint8_t ld_acquire_sys_global(const uint8_t *ptr) {
@@ -117,7 +83,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 
 
 #define SHIFTED_ADDR(a) ((a) + (DIV4080(a) * PCIE_TAIL_SZ))
-#define PTR_DIFF(a, b) (reinterpret_cast<uint8_t*>(a) - reinterpret_cast<uint8_t*>(b))
+#define PTR_DIFF(a, b) (reinterpret_cast<const uint8_t*>(a) - reinterpret_cast<const uint8_t*>(b))
 #define SHIFTED_ADDR_P(ptr, bptr) ((ptr) + DIV4080(PTR_DIFF(ptr, bptr)) * PCIE_TAIL_SZ / sizeof(*(ptr)))
 #define IS_PAGE_SUB_HEAD(ptr, bptr, size) (((PTR_DIFF(ptr, bptr) == (size)) || (PTR_DIFF(ptr, bptr) % (PCIE_SEG_LEN - PCIE_TAIL_SZ)) == 0))
 #define CHK_POSITION(bptr, ext_size, pn, ptotal) (reinterpret_cast<uint8_t*>(bptr) + ((pn == ptotal - 1) ? (ext_size - PCIE_TAIL_SZ) : (((pn) << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ))))
@@ -129,7 +95,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 #define TAG_TYPE(tag) ((tag >> 31) & 1)
 #define SHORT_TAG(tag) (((TAG_TYPE(tag) << 15) | ((((tag) & TAG_CNT_MASK) % 0x7fff) + 1)) << 16)
 #define CHECK_TIME_MASK 0xffffff
-#define FINAL_TIME_MASK 0x10000000
+#define FINAL_TIME_MASK 0x1000000
 
 
 #define PARALLEL_SET_TAG(send_buf, ext_len, tagv, exec_id, exec_total, st_func) {\
@@ -330,24 +296,146 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
     }\
 }
 
-#endif // __CUDACC__
+#define EXT_SIZE_TIGHT(x) (x + (((x) >> PCIE_SEG_LEN_LOG) + 1) * sizeof(int))
+#define TOKEN_OUT_OF_RANGE(idx, count) ((count) != 0 && ((idx) >= (-(count)-1)))
 
-#define EAGER_LOAD 0
-#define EAGER_OFF 1
-#define EAGER_CHK 2
-#define EAGER_FULL 3
-#define EAGER_DEBUG 10
 
-#define SWITCH_EAGER(inner_macro, ...) \
-do { \
-    switch (eager_opt) { \
-        case EAGER_LOAD: inner_macro(EAGER_LOAD, __VA_ARGS__); break; \
-        case EAGER_OFF: inner_macro(EAGER_OFF, __VA_ARGS__); break; \
-        case EAGER_CHK: inner_macro(EAGER_CHK, __VA_ARGS__); break; \
-        case EAGER_FULL: inner_macro(EAGER_FULL, __VA_ARGS__); break; \
-        default: EP_HOST_ASSERT(false && "Unsupported EAGER option"); \
-    } \
-} while (0); break;
+template <typename T>
+__device__ __forceinline__ void Normal_ST(T *ptr, T& value) {
+    *ptr = value;
+}
+
+template <typename T>
+__device__ __forceinline__ T Normal_LD(const T *ptr) {
+    return *ptr;
+}
+
+__device__ __forceinline__ void Default_Eager_Timeout_Func(const int* ptr, int value) {
+    printf("[EAGER TAG CHECK TIMEOUT] ptr: %p, value: 0x%08x\n", ptr, value);
+}
+
+class EagerRDMASendBuffer {
+    void *buf;
+    size_t original_len;
+    int tag_value;
+    void (*tag_st_func)(int *, int);
+public:
+    __device__ EagerRDMASendBuffer(void *send_buf, size_t original_len, int tag_value, void (*int_st_func)(int*, int)): buf(send_buf), original_len(original_len), tag_value(tag_value), tag_st_func(int_st_func) {}
+    __device__ EagerRDMASendBuffer(void *send_buf, size_t original_len, int tag_value): buf(send_buf), original_len(original_len), tag_value(tag_value), tag_st_func(nullptr) {}
+    template <int kEager, typename T, typename Func, bool kNormalLDST = false>
+    __device__ __forceinline__ void store(Func&& func, T* ptr, T value) {
+        if constexpr (kEager != EAGER_OFF) {
+            EP_STATIC_ASSERT(sizeof(T) >= sizeof(int), "can not support <4 byte element read/write");
+            auto ptr_diff = PTR_DIFF(ptr, buf);
+            if ((ptr_diff & PCIE_SEG_LEN_MASK) == (PCIE_SEG_LEN - PCIE_TAIL_SZ)) {
+                auto st_ptr = &reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buf) + original_len)[ptr_diff >> PCIE_SEG_LEN_LOG];
+                auto *bp = reinterpret_cast<int*>(&value);
+                if constexpr (kNormalLDST) {
+                    *st_ptr = *bp;
+                } else {
+                    tag_st_func(st_ptr, *bp);
+                }
+                *bp = tag_value;
+            }
+            if (ptr_diff + sizeof(T) == original_len) {
+                auto st_ptr = &reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buf) + original_len)[original_len >> PCIE_SEG_LEN_LOG];
+                if constexpr (kNormalLDST) {
+                    *st_ptr = tag_value;
+                } else {
+                    tag_st_func(st_ptr, tag_value);
+                }
+            }
+        }
+        if constexpr (kNormalLDST) {
+            *ptr = value;
+        } else {
+            func(ptr, value);
+        }
+    }
+    template <int kEager, typename T>
+    __device__ __forceinline__ void store(T* ptr, T& value) {
+        this->store<kEager, T, decltype(&Normal_ST<T>), true>(&Normal_ST<T>, ptr, value);
+    }
+};
+
+class EagerRDMARecvBuffer {
+    void *buf;
+    size_t original_len;
+    int tag_value;
+    int (*int_load_func)(const int*);
+public:
+    __device__ EagerRDMARecvBuffer(void *recv_buf, size_t original_len, int tag_value, int (*int_load_func)(const int*) = nullptr): buf(recv_buf), original_len(original_len), tag_value(tag_value), int_load_func(int_load_func) {}
+    template <int kEager, typename T, typename Func, bool kNormalLDST = false>
+    __device__ __forceinline__ T load(T* ptr, Func&& func) {
+        std::remove_const_t<T> ld_value = func(ptr);
+        if constexpr (kEager != EAGER_OFF) {
+            auto ptr_diff = PTR_DIFF(ptr, buf);
+            if ((ptr_diff & PCIE_SEG_LEN_MASK) >= (PCIE_SEG_LEN - PCIE_TAIL_SZ) && (ptr_diff & PCIE_SEG_LEN_MASK) < (PCIE_SEG_LEN - PCIE_TAIL_SZ + sizeof(T))) {
+                auto ld_ptr = &reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buf) + original_len)[ptr_diff >> PCIE_SEG_LEN_LOG];
+                int got;
+                if constexpr (kNormalLDST) {
+                    got = *ld_ptr;
+                } else {
+                    got = int_load_func(ld_ptr);
+                }
+                if constexpr (sizeof(T) >= sizeof(int)) {
+                    *reinterpret_cast<int*>(&ld_value) = got;
+                } else {
+                    ld_value = static_cast<T>(got >> ((ptr_diff & PCIE_SEG_LEN_MASK) - (PCIE_SEG_LEN - PCIE_TAIL_SZ)));
+                }
+            }
+        }
+        return ld_value;
+    }
+    template <int kEager, typename T>
+    __device__ __forceinline__ T load(T *ptr) {
+        return this->load<kEager, T, decltype(&Normal_LD<T>), true>(&Normal_LD<T>, ptr);
+    }
+    template <int kEager, bool kCountCheck = false, typename PrintFunc>
+    __device__ __forceinline__ void wait(int exec_id, int exec_total, PrintFunc func, int &count, int token_idx = 0, int *count_ptr = nullptr, int *count_cache_ptr = nullptr, bool count_use_cache = false) {
+        if constexpr (kEager != EAGER_OFF) {
+            int __page_n = (original_len >> PCIE_SEG_LEN_LOG) + 1;
+            size_t ext_len = EXT_SIZE_TIGHT(original_len);
+            for (int target = exec_id; target < __page_n; target += exec_total) {
+                int ld_value, w_cnt = 0;
+                int* __check_ptr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buf) + ((target == __page_n - 1) ? (ext_len - sizeof(int)) : ((target << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
+                while (true) {
+                    ld_value = ld_acquire_sys_global(__check_ptr);
+                    if (ld_value == ZTAG(tag_value)) break;
+                    if constexpr (kCountCheck) {
+                        if (count == 0) {
+                            if (!count_use_cache) {
+                                count = ld_relaxed_sys_global(count_ptr);
+                                count = ((count & 0xffff0000) == SHORT_TAG(tag_value)) ? (count | 0xffff0000) : 0;
+                                if (count != 0) {
+                                    st_release_cta(count_cache_ptr, count);
+                                }
+                            } else {
+                                count = ld_acquire_cta(count_cache_ptr);
+                            }
+                            if (TOKEN_OUT_OF_RANGE(token_idx, count)) {
+                                break;
+                            }
+                        }
+                    }
+                    w_cnt += 1;
+                    if (w_cnt == FINAL_TIME_MASK) {
+                        func(__check_ptr, ld_value);
+                        trap();
+                    }
+                }
+            }
+        }
+    }
+};
+
+#define EagerAutoAMO(ptr, value, dst_pe, qp_id) {\
+    if constexpr (kEager <= EAGER_OFF) {\
+        nvshmemi_ibgda_amo_nonfetch_add(ptr, value, dst_pe, qp_id);\
+    } else {\
+        nvshmemi_ibgda_rma_p(ptr, value, dst_pe, qp_id);\
+    }\
+}
 
 };
 

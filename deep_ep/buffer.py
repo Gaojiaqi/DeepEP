@@ -29,7 +29,7 @@ class Buffer:
 
     num_sms: int = 20
 
-    # eager.cuh defs
+    # eager.h defs
     EAGER_LOAD = 0
     EAGER_OFF = 1
     EAGER_CHK = 2

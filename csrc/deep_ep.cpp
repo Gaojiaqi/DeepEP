@@ -10,7 +10,7 @@
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
-#include "kernels/eager.cuh"
+#include "kernels/eager.h"
 #include "kernels/exception.cuh"
 
 namespace deep_ep {

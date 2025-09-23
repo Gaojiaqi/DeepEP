@@ -82,7 +82,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
     constexpr size_t num_bytes_per_msg_v = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
-    constexpr size_t num_bytes_per_msg = kEager != EAGER_OFF ? EXTEND_FOR_TAG_AND_ALIGN(num_bytes_per_msg_v, AR_MSG_ALIGNMENT) : num_bytes_per_msg_v;
+    constexpr size_t num_bytes_per_msg_tight = CEIL_ALIGN(num_bytes_per_msg_v + ((num_bytes_per_msg_v >> PCIE_SEG_LEN_LOG) + 1) * sizeof(int), sizeof(int4));
+    constexpr size_t num_bytes_per_msg = kEager != EAGER_OFF ? num_bytes_per_msg_tight : num_bytes_per_msg_v;
     
     // WARNING!!! Two lines below must be consistent with msg def in config.hpp
     constexpr size_t dispatch_msg_max = sizeof(int4) + std::max(kHidden * sizeof(nv_bfloat16), kHidden + num_scales * sizeof(float));
@@ -91,8 +92,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     constexpr size_t short_msg_len = sizeof(int4) + kHidden + num_scales * sizeof(float); // FP8 dispatch msg len, used for tag reset position
     constexpr size_t short_msg_final_tag = SHIFTED_ADDR(short_msg_len);
 
-    constexpr size_t scale_ldst_offset = sizeof(int4) * (kHidden == 8192 ? 2 : (kHidden < 4096 ? 0 : 1));
-    constexpr size_t scale_ldst_float_offset = kEager != EAGER_OFF ? (scale_ldst_offset / sizeof(float)) : 0;
+    // constexpr size_t scale_ldst_offset = sizeof(int4) * (kHidden == 8192 ? 2 : (kHidden < 4096 ? 0 : 1));
+    // constexpr size_t scale_ldst_float_offset = kEager != EAGER_OFF ? (scale_ldst_offset / sizeof(float)) : 0;
 
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
@@ -126,13 +127,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
-            constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
-            constexpr size_t page_int2 = page_int4 << 1;
-            const size_t data_st_int4_offset = kEager != EAGER_OFF ? DIV255(thread_id + 1) : 0; // page_int4 == 255
-            const size_t data_st_int2_offset = kEager != EAGER_OFF ? ((thread_id + 2) < page_int2 ? 0 : (thread_id + 2) < 2 * page_int2 ? 2 : 4) : 0;
-
+            // constexpr size_t page_int4 = (PCIE_SEG_LEN - PCIE_TAIL_SZ) / sizeof(int4);
+            // constexpr size_t page_int2 = page_int4 << 1;
+            // const size_t data_st_int4_offset = kEager != EAGER_OFF ? DIV255(thread_id + 1) : 0; // page_int4 == 255
+            // const size_t data_st_int2_offset = kEager != EAGER_OFF ? ((thread_id + 2) < page_int2 ? 0 : (thread_id + 2) < 2 * page_int2 ? 2 : 4) : 0;
+            
+            auto e_wrapper = EagerRDMASendBuffer(rdma_x_src_idx, num_bytes_per_msg_v, ZTAG(dispatch_round_n));
             if (thread_id == 0) {
-                *rdma_x_src_idx = token_idx; // first element never shift...
+                //*rdma_x_src_idx = token_idx; // first element never shift...
+                e_wrapper.store<kEager>(rdma_x_src_idx, token_idx);
             }
 
             // FP8 cast
@@ -158,7 +161,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     amax = warp_reduce_max<16>(amax);
                     calculate_fp8_scales(amax, scale, scale_inv, round_scale);
                     if (lane_id == 0 or lane_id == 16) {
-                        rdma_x_scales[i * kNumElemsPerRead / 128 + scale_ldst_float_offset] = scale_inv;
+                        e_wrapper.store<kEager>(&rdma_x_scales[i * kNumElemsPerRead / 128], scale_inv);
                     }
 
                     // Cast into send buffer
@@ -169,17 +172,19 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                         float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
                     }
-                    rdma_x_vec[i + data_st_int2_offset] = int2_value;
+                    //rdma_x_vec[i + data_st_int2_offset] = int2_value;
+                    e_wrapper.store<kEager>(&rdma_x_vec[i], int2_value);
                 } else {
                     // Reinterpret-cast is for C++14 compatibility
-                    rdma_x_vec[i + data_st_int4_offset] = *reinterpret_cast<vec_t*>(&int4_value);
+                    //rdma_x_vec[i + data_st_int4_offset] = *reinterpret_cast<vec_t*>(&int4_value);
+                    e_wrapper.store<kEager>(&rdma_x_vec[i], *reinterpret_cast<vec_t*>(&int4_value));
                 }
             }
-            if constexpr (kEager != EAGER_OFF) {
-                if (warp_id == 0) {
-                    PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg, dispatch_round_n, lane_id, 32, NORMAL_ST);
-                }
-            }
+            // if constexpr (kEager != EAGER_OFF) {
+            //     if (warp_id == 0) {
+            //         PARALLEL_SET_TAG(rdma_x_src_idx, num_bytes_per_msg, dispatch_round_n, lane_id, 32, NORMAL_ST);
+            //     }
+            // }
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
 
             // Issue IBGDA sends
@@ -204,7 +209,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg - (kEager == EAGER_OFF ? 0 : 1), dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                 }
 
                 // Increase counter after finishing
@@ -251,7 +256,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
             if (lane_id == 0) {
                 shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
-                atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+                atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum + (kEager == EAGER_FULL ? FINISHED_SUM_TAG : 0));
             }
         }
     }
@@ -264,19 +269,11 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto num_tokens_sent = -shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups]-1;
         const auto send_cnt = kEager == EAGER_FULL ? (SHORT_TAG(dispatch_round_n) | (num_tokens_sent & 0xffff)) : num_tokens_sent;
         // Wait local sends issued and send expert counts
-        if constexpr (kEager == EAGER_OFF) {
-            while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
-        } else {
-            while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG);
-        }
+        while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
         auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
         if (dst_p2p_ptr == 0) {
-            if constexpr (kEager <= EAGER_OFF) {
-                nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), send_cnt, dst_rank, dst_expert_local_idx);
-            } else {
-                nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), send_cnt, dst_rank, dst_expert_local_idx);
-            }
+            EagerAutoAMO(reinterpret_cast<int*>(dst_ptr), send_cnt, dst_rank, dst_expert_local_idx);
         } else {
             if (dst_rank != rank) {
                 st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), send_cnt);
@@ -364,11 +361,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) == 0);
                 } else {
                     while (((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) & 0xffff0000) != SHORT_TAG(dispatch_round_n));
-                }
-                auto wait_recv_cost = clock64() - start_time;
-                if constexpr (kEager == EAGER_FULL) {
                     num_recv_tokens = num_recv_tokens | 0xffff0000;
                 }
+                auto wait_recv_cost = clock64() - start_time;
                 num_recv_tokens = -num_recv_tokens - 1;
                 recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
                 shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -395,12 +390,16 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * msg_distance);
             
+            auto e_wrapper = EagerRDMARecvBuffer(src_src_idx, num_bytes_per_msg_v, ZTAG(dispatch_round_n), ld_nc_global);
+            auto timeout_func = [&](void *check_ptr, int latest_value) {printf("[rank %d]: [EAGER DISPATCH HANG] round 0x%08x expert %d token %d/%d from rank %d, check offset %lu, 0x%08x != 0x%08x\n", rank, dispatch_round_n, local_expert_idx + rank * num_local_experts, i, -num_recv_tokens - 1, src_rank, PTR_DIFF(check_ptr, src_src_idx), latest_value, ZTAG(dispatch_round_n));}; // for debug use, optional
             if constexpr (kEager == EAGER_FULL) {
                 if (!ld_intra_node) {
-                    WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, sub_warp_id, shared_num_recv_tokens + warp_group_id, "DISPATCH");
+                    //WAIT_2BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, rcv_cnt_ptr, num_recv_tokens, i, sub_warp_id, shared_num_recv_tokens + warp_group_id, "DISPATCH");
+                    e_wrapper.wait<kEager, true>(lane_id, 32, timeout_func, num_recv_tokens, i, rcv_cnt_ptr, shared_num_recv_tokens + warp_group_id, sub_warp_id != 0);
+
                     num_recv_tokens = warp_reduce_min(num_recv_tokens);
                     
-                    if (num_recv_tokens != 0 && i >= (-num_recv_tokens-1)) {
+                    if (TOKEN_OUT_OF_RANGE(i, num_recv_tokens)) {
                         break;
                     }
                 }
@@ -420,7 +419,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     }
                 }
             } else if constexpr (kEager != EAGER_OFF) {
-                WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, i, -1, local_expert_idx + rank * num_local_experts, rank, "DISPATCH");
+                e_wrapper.wait<kEager>(lane_id, 32, timeout_func, num_recv_tokens);
+                __syncwarp();
+                //WAIT_BIT(src_src_idx, num_bytes_per_msg, lane_id, 32, dispatch_round_n, i, -1, local_expert_idx + rank * num_local_experts, rank, "DISPATCH");
             }
             
             if constexpr (kEager != EAGER_FULL) {
@@ -436,7 +437,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + this_token_index_in_recv * hidden_int4;
             if constexpr (kEager != EAGER_OFF) {
-                UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, ld_nc_global, st_na_global);
+                //UNROLLED_WARP_COPY_SRC_AUTO_SHIFT(7, lane_id, hidden_int4, dst_data, src_data, src_src_idx, ld_nc_global, st_na_global);
+                auto e_load_func = [&] (const int4* ptr) -> int4 { return e_wrapper.load<kEager>(ptr, [](const auto *_ptr) {return ld_nc_global(_ptr);});};
+                UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, e_load_func, st_na_global)
             } else {
                 UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
             }
@@ -452,13 +455,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 if (lane_id < num_scales) {
                     const auto pack_idx = lane_id / num_elems_per_pack;
                     const auto elem_idx = lane_id % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + scale_ldst_float_offset));
+                    auto scale = extract_required_scale_format<kUseUE8M0>(e_wrapper.load<kEager>(src_scales + lane_id, [](const auto *_ptr) {return ld_nc_global(_ptr);}));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
                 if (lane_id + 32 < num_scales) {
                     const auto pack_idx = (lane_id + 32) / num_elems_per_pack;
                     const auto elem_idx = (lane_id + 32) % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32 + scale_ldst_float_offset));
+                    auto scale = extract_required_scale_format<kUseUE8M0>(e_wrapper.load<kEager>(src_scales + lane_id + 32, [](const auto *_ptr) {return ld_nc_global(_ptr);}));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
             } else {

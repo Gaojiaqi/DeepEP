@@ -2,7 +2,7 @@
 
 #include "kernels/api.cuh"
 #include "kernels/exception.cuh"
-#include "kernels/eager.cuh"
+#include "kernels/eager.h"
 
 namespace deep_ep {
 
