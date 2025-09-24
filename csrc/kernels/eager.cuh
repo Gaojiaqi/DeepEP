@@ -84,7 +84,7 @@ __forceinline__ __device__ int warp_reduce_min(int value) {
 
 #define SHIFTED_ADDR(a) ((a) + (DIV4080(a) * PCIE_TAIL_SZ))
 #define PTR_DIFF(a, b) (reinterpret_cast<const uint8_t*>(a) - reinterpret_cast<const uint8_t*>(b))
-#define SHIFTED_ADDR_P(ptr, bptr) ((ptr) + DIV4080(PTR_DIFF(ptr, bptr)) * PCIE_TAIL_SZ / sizeof(*(ptr)))
+#define SHIFTED_ADDR_P(ptr, bptr) ((ptr) + DIV4080(PTR_DIFF(ptr, bptr)) * PCIE_TAIL_SZ / sizeof(decltype(*(ptr))))
 #define IS_PAGE_SUB_HEAD(ptr, bptr, size) (((PTR_DIFF(ptr, bptr) == (size)) || (PTR_DIFF(ptr, bptr) % (PCIE_SEG_LEN - PCIE_TAIL_SZ)) == 0))
 #define CHK_POSITION(bptr, ext_size, pn, ptotal) (reinterpret_cast<uint8_t*>(bptr) + ((pn == ptotal - 1) ? (ext_size - PCIE_TAIL_SZ) : (((pn) << PCIE_SEG_LEN_LOG) + (PCIE_SEG_LEN - PCIE_TAIL_SZ))))
 #define EXT_PAGE_N(size) ((size >> PCIE_SEG_LEN_LOG) + ((size & PCIE_SEG_LEN_MASK) != 0))
@@ -318,8 +318,8 @@ class EagerRDMASendBuffer {
     void *buf;
     size_t original_len;
     int tag_value;
-    void (*tag_st_func)(int *, int);
 public:
+    void (*tag_st_func)(int *, int);
     __device__ EagerRDMASendBuffer(void *send_buf, size_t original_len, int tag_value, void (*int_st_func)(int*, int)): buf(send_buf), original_len(original_len), tag_value(tag_value), tag_st_func(int_st_func) {}
     __device__ EagerRDMASendBuffer(void *send_buf, size_t original_len, int tag_value): buf(send_buf), original_len(original_len), tag_value(tag_value), tag_st_func(nullptr) {}
     template <int kEager, typename T, typename Func, bool kNormalLDST = false>
@@ -356,6 +356,50 @@ public:
     __device__ __forceinline__ void store(T* ptr, T& value) {
         this->store<kEager, T, decltype(&Normal_ST<T>), true>(&Normal_ST<T>, ptr, value);
     }
+    template <int kEager, typename T, typename Func, bool kNormalLDST = false>
+    __device__ __forceinline__ void shift_store(Func&& func, T* ptr, T value) {
+        if constexpr (kEager != EAGER_OFF) {
+            EP_STATIC_ASSERT(sizeof(T) >= sizeof(int), "can not support <4 byte element read/write");
+            if constexpr (kNormalLDST) {
+                N_ST_SHIFTED(ptr, value, buf);
+            } else {
+                ST_SHIFTED(func, ptr, buf, value);
+            }
+        } else {
+            if constexpr (kNormalLDST) {
+                *ptr = value;
+            } else {
+                func(ptr, value);
+            }
+        }
+    }
+    template <int kEager, typename T>
+    __device__ __forceinline__ void shift_store(T* ptr, T& value) {
+        this->shift_store<kEager, T, decltype(&Normal_ST<T>), true>(&Normal_ST<T>, ptr, value);
+    }
+    template <int kEager, bool kNormalLDST = false>
+    __device__ __forceinline__ void shift_tag(int exec_id, int exec_total) {
+        if constexpr (kEager != EAGER_OFF) {
+        auto ext_len = EXTEND_FOR_TAG_AND_ALIGN(original_len, AR_MSG_ALIGNMENT);
+            if (!kNormalLDST) {
+                PARALLEL_SET_TAG(buf, ext_len, tag_value, exec_id, exec_total, tag_st_func);
+            } else {
+                PARALLEL_SET_TAG(buf, ext_len, tag_value, exec_id, exec_total, NORMAL_ST);
+            }
+        }
+    }
+    
+    __device__ __forceinline__ void* buffer() {
+        return buf;
+    }
+
+    __device__ __forceinline__ size_t len() {
+        return original_len;
+    }
+
+    __device__ __forceinline__ int tag_v() {
+        return tag_value;
+    }
 };
 
 class EagerRDMARecvBuffer {
@@ -391,14 +435,34 @@ public:
     __device__ __forceinline__ T load(T *ptr) {
         return this->load<kEager, T, decltype(&Normal_LD<T>), true>(&Normal_LD<T>, ptr);
     }
+    template <int kEager, typename T, typename Func, bool kNormalLDST = false>
+    __device__ __forceinline__ T shift_load(T* ptr, Func&& func) {
+        if constexpr (kEager != EAGER_OFF) {
+            if constexpr (kNormalLDST) {
+                return N_LD_SHIFTED(ptr, buf);
+            } else {
+                return LD_SHIFTED(func, ptr, buf);
+            }
+        } else {
+            if constexpr (kNormalLDST) {
+                return *ptr;
+            } else {
+                return func(ptr);
+            }
+        }
+    }
+    template <int kEager, typename T>
+    __device__ __forceinline__ T shift_load(T *ptr) {
+        return this->shift_load<kEager, T, decltype(&Normal_LD<T>), true>(&Normal_LD<T>, ptr);
+    }
     template <int kEager, bool kCountCheck = false, typename PrintFunc>
     __device__ __forceinline__ void wait(int exec_id, int exec_total, PrintFunc func, int &count, int token_idx = 0, int *count_ptr = nullptr, int *count_cache_ptr = nullptr, bool count_use_cache = false) {
         if constexpr (kEager != EAGER_OFF) {
             int __page_n = (original_len >> PCIE_SEG_LEN_LOG) + 1;
-            size_t ext_len = EXT_SIZE_TIGHT(original_len);
+            size_t ext_len = EXTEND_FOR_TAG_AND_ALIGN(original_len, AR_MSG_ALIGNMENT);
             for (int target = exec_id; target < __page_n; target += exec_total) {
                 int ld_value, w_cnt = 0;
-                int* __check_ptr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buf) + ((target == __page_n - 1) ? (ext_len - sizeof(int)) : ((target << PCIE_SEG_LEN_LOG) + PCIE_SEG_LEN - PCIE_TAIL_SZ)));
+                int* __check_ptr = reinterpret_cast<int*>(CHK_POSITION(buf, ext_len, target, __page_n));
                 while (true) {
                     ld_value = ld_acquire_sys_global(__check_ptr);
                     if (ld_value == ZTAG(tag_value)) break;
@@ -427,6 +491,10 @@ public:
             }
         }
     }
+
+    __device__ __forceinline__ void* buffer() {
+        return buf;
+    }
 };
 
 #define EagerAutoAMO(ptr, value, dst_pe, qp_id) {\
@@ -436,6 +504,16 @@ public:
         nvshmemi_ibgda_rma_p(ptr, value, dst_pe, qp_id);\
     }\
 }
+
+#define E_WRAPPER_SHIFT_LOAD(kEager, wrapper, func, ptr) (kEager != EAGER_OFF ? LD_SHIFTED(func, ptr, wrapper.buffer()) : func(ptr))
+#define E_WRAPPER_SHIFT_STORE(kEager, wrapper, func, ptr, value) {\
+    if constexpr (kEager != EAGER_OFF) {\
+        ST_SHIFTED(func, ptr, wrapper.buffer(), value);\
+    } else {\
+        func(ptr, value);\
+    }\
+}
+#define E_WRAPPER_SHIFT_TAG(wrapper, exec_id, exec_total) if constexpr (kEager != EAGER_OFF) PARALLEL_SET_TAG(wrapper.buffer(), EXTEND_FOR_TAG_AND_ALIGN(wrapper.len(), AR_MSG_ALIGNMENT), wrapper.tag_v(), exec_id, exec_total, wrapper.tag_st_func)
 
 };
 
